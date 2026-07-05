@@ -78,6 +78,20 @@ skip the router preamble · `--session <id>` reuse an oc session ·
 8. **Token-frugal output** — compact ~20-line summary + job id; full agent
    output lands in `jobs/<id>.out.md` for on-demand reading.
 
+## Automatic model failover (oc lane)
+
+Free-model pools fail in boring ways: a model hangs mid-generation, returns
+empty, or rate-limits. The oc lane retries across a **capability-tier chain**
+(max 3 attempts, fresh session each): on stale (frozen message count),
+timeout, empty response, HTTP error, or rate-limit, the session is aborted
+and the same task re-fires with the next model as a per-call override — the
+agent's configured default is never edited. Every attempt is recorded in the
+job JSON (`attempts: [{model, outcome}]`) and the answering model is shown
+as `via=` in the output. Chains are data (see `offload chains`), overridable
+per-tier in `config.json`; limited pools are guarded (a daily counter stops
+OpenRouter free-pool use at 45/50 shared). Disable with `--no-fallback`, or
+pass an explicit `--model` (your choice is respected, no chain).
+
 ## Job model
 
 Every run writes `jobs/<id>.json` (state) and `jobs/<id>.out.md` (result).

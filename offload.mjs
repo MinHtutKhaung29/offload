@@ -22,6 +22,26 @@ const DEFAULTS = {
   vault: process.env.OFFLOAD_VAULT || null,
 };
 
+// Failover chains per capability tier (grounded in CLAUDE_OPENCODE_RULES.md
+// pool analysis: Zen/Cerebras generous; Groq only the 14.4k-RPD 8B model;
+// OpenRouter free = 50/day SHARED, last resort + counted; NIM fenced to heavy).
+// chain[0] documents the tier's configured primary; attempt 1 always runs the
+// agent's own default, so failover starts at chain[1].
+const CHAINS = {
+  build:   ['opencode/deepseek-v4-flash-free', 'opencode/mimo-v2.5-free', 'opencode/nemotron-3-ultra-free', 'cerebras/zai-glm-4.7', 'groq/llama-3.1-8b-instant', 'openrouter/nvidia/nemotron-3-super-120b-a12b:free'],
+  explore: ['opencode/deepseek-v4-flash-free', 'opencode/mimo-v2.5-free', 'groq/llama-3.1-8b-instant'],
+  review:  ['opencode/north-mini-code-free', 'opencode/deepseek-v4-flash-free', 'cerebras/zai-glm-4.7'],
+  plan:    ['google/gemini-3.1-pro-preview', 'opencode/mimo-v2.5-free'],
+  heavy:   ['nvidia/deepseek-ai/deepseek-v4-pro', 'google/gemini-3.1-pro-preview'],
+};
+const AGENT_TIER = {
+  build: 'build', general: 'build', 'backend-developer': 'build', 'ecc-frontend-builder': 'build', 'refactor-cleaner': 'build',
+  explore: 'explore', 'docs-lookup': 'explore', librarian: 'explore',
+  'code-reviewer': 'review', architect: 'plan', planner: 'plan', 'security-reviewer': 'heavy',
+};
+const MAX_ATTEMPTS = 3;
+const OPENROUTER_DAILY_STOP = 45; // pool is 50/day shared with agents we don't see
+
 fs.mkdirSync(JOBS, { recursive: true });
 const cfgPath = path.join(BASE, 'config.json');
 const cfg = fs.existsSync(cfgPath)
@@ -112,7 +132,8 @@ function summarize(job, text) {
   fs.writeFileSync(outFile(job.id), text || '(empty response)');
   const lines = (text || '').trim().split('\n');
   const excerpt = lines.length > 20 ? lines.slice(0, 20).join('\n') + `\n... (${lines.length - 20} more lines)` : lines.join('\n');
-  const head = `[${job.id}] ${job.status} | lane=${job.lane} agent=${job.agent || job.model} | full output: ${outFile(job.id)}`;
+  const via = job.finalModel && job.finalModel !== '(agent default)' ? ` via=${job.finalModel}` : '';
+  const head = `[${job.id}] ${job.status} | lane=${job.lane} agent=${job.agent || job.model}${via} | full output: ${outFile(job.id)}`;
   if (opt.json) return { id: job.id, status: job.status, lane: job.lane, outFile: outFile(job.id), excerpt };
   return head + '\n' + (opt.full ? text : excerpt);
 }
@@ -148,26 +169,42 @@ function textParts(msgs) {
   return t.trim();
 }
 
-async function runOc(job) {
+// ---------- quota counter (OpenRouter free pool: 50/day shared) ----------
+const quotaFile = path.join(JOBS, '_quota.json');
+function quotaToday() {
+  const today = new Date().toISOString().slice(0, 10);
+  try {
+    const q = JSON.parse(fs.readFileSync(quotaFile, 'utf8'));
+    if (q.date === today) return q;
+  } catch { /* fresh day */ }
+  return { date: today, openrouter: 0 };
+}
+function bumpQuota(model) {
+  if (!model || !model.startsWith('openrouter/')) return;
+  const q = quotaToday();
+  q.openrouter++;
+  fs.writeFileSync(quotaFile, JSON.stringify(q));
+}
+
+// one delegation attempt; throws typed errors so the failover loop can decide
+async function runOcAttempt(job, modelStr) {
   const q = { directory: job.dir };
-  const ses = job.sessionId
-    ? { id: job.sessionId }
-    : await api('POST', '/session', { title: `offload ${job.id}` }, q);
+  const ses = await api('POST', '/session', { title: `offload ${job.id}` }, q);
   job.sessionId = ses.id;
   if (ses.directory && path.resolve(ses.directory) !== path.resolve(job.dir))
     throw new Error(`session directory mismatch: wanted ${job.dir}, got ${ses.directory}`);
   saveJob(job);
 
+  bumpQuota(modelStr);
   const body = {
     agent: job.agent,
     parts: [{ type: 'text', text: job.fullPrompt }],
-    ...(job.modelRef ? { model: job.modelRef } : {}),
+    ...(modelStr ? { model: parseModel(modelStr) } : {}),
   };
   await api('POST', `/session/${ses.id}/prompt_async`, body, q);
 
-  // poll: done when the last assistant message has time.completed
   const timeoutMs = (Number(job.timeout) || 600) * 1000;
-  const staleMs = 10 * 60 * 1000;
+  const staleMs = Math.min(10 * 60 * 1000, timeoutMs);
   const start = Date.now();
   let lastSig = '', lastChange = Date.now();
   for (;;) {
@@ -178,21 +215,56 @@ async function runOc(job) {
     const sig = JSON.stringify(msgs).length + ':' + asst.length;
     if (sig !== lastSig) { lastSig = sig; lastChange = Date.now(); }
     if (last?.info?.time?.completed) {
+      const text = textParts(msgs);
+      if (!text.trim()) { const e = new Error('empty response'); e.kind = 'empty'; throw e; }
+      return text;
+    }
+    if (Date.now() - lastChange > staleMs) { const e = new Error(`no session activity for ${staleMs / 1000}s`); e.kind = 'stale'; throw e; }
+    if (Date.now() - start > timeoutMs) { const e = new Error(`no completion after ${timeoutMs / 1000}s`); e.kind = 'timeout'; throw e; }
+  }
+}
+
+async function runOc(job) {
+  // model plan: explicit --model or --no-fallback = single attempt; otherwise
+  // agent default first, then the tier chain (skipping chain[0] = the default)
+  let models;
+  if (job.modelStr || opt['no-fallback']) models = [job.modelStr];
+  else {
+    const chain = (cfg.chains || CHAINS)[AGENT_TIER[job.agent] || 'build'] || CHAINS.build;
+    const orBlocked = quotaToday().openrouter >= OPENROUTER_DAILY_STOP;
+    models = [undefined, ...chain.slice(1).filter(m => {
+      if (orBlocked && m.startsWith('openrouter/')) {
+        console.error(`offload: skipping ${m} (OpenRouter free pool at ${quotaToday().openrouter}/day, stop=${OPENROUTER_DAILY_STOP})`);
+        return false;
+      }
+      return true;
+    })].slice(0, MAX_ATTEMPTS);
+  }
+
+  job.attempts = [];
+  let lastErr;
+  for (const m of models) {
+    const label = m || '(agent default)';
+    try {
+      const text = await runOcAttempt(job, m);
+      job.attempts.push({ model: label, outcome: 'ok' });
+      job.finalModel = label;
       job.status = 'done';
       saveJob(job);
-      return textParts(msgs);
-    }
-    if (Date.now() - lastChange > staleMs) {
-      job.status = 'stale';
+      return text;
+    } catch (e) {
+      const kind = e.kind || (/429|rate.?limit|quota/i.test(e.message) ? 'ratelimit' : 'error');
+      job.attempts.push({ model: label, outcome: kind });
       saveJob(job);
-      throw new Error(`no session activity for 10min — likely hung. Check: offload status ${job.id}; abort: offload abort ${job.id}`);
-    }
-    if (Date.now() - start > timeoutMs) {
-      job.status = 'timeout';
-      saveJob(job);
-      throw new Error(`timed out after ${timeoutMs / 1000}s — server may still be working. Check offload status ${job.id} before retrying (retry duplicates work).`);
+      lastErr = e;
+      if (job.sessionId) { try { await api('POST', `/session/${job.sessionId}/abort`, {}, { directory: job.dir }); } catch { /* best effort */ } }
+      const next = models[models.indexOf(m) + 1];
+      if (next !== undefined) console.error(`offload: [${job.id}] ${label} failed (${kind}) — failing over to ${next}`);
     }
   }
+  job.status = job.attempts[job.attempts.length - 1]?.outcome === 'timeout' ? 'timeout' : 'error';
+  saveJob(job);
+  throw new Error(`all ${job.attempts.length} attempt(s) failed [${job.attempts.map(a => `${a.model}:${a.outcome}`).join(', ')}]. Last: ${lastErr.message}. Check offload status ${job.id} before retrying.`);
 }
 
 // ---------- agy lane ----------
@@ -258,7 +330,7 @@ async function cmdRun(lane) {
     id: newId(), lane, dir, status: 'running', created: now(),
     agent: lane === 'oc' ? target : undefined,
     model: lane === 'agy' ? target : opt.model,
-    modelRef: lane === 'oc' ? parseModel(opt.model) : undefined,
+    modelStr: lane === 'oc' ? opt.model : undefined,
     sessionId: opt.session, timeout: opt.timeout,
     task: task.slice(0, 200),
     fullPrompt: buildPrompt(task, dir),
@@ -328,6 +400,14 @@ function cmdModels() {
   out('agy:\n' + (r.stdout || r.stderr || 'unavailable').trim(), { agy: (r.stdout || '').trim().split('\n') });
 }
 
+function cmdChains() {
+  const chains = cfg.chains || CHAINS;
+  const q = quotaToday();
+  const lines = Object.entries(chains).map(([t, c]) => `${t.padEnd(8)} ${c.join('  ->  ')}`);
+  lines.push(`\nOpenRouter free pool today: ${q.openrouter}/${OPENROUTER_DAILY_STOP} (hard pool cap 50/day shared)`);
+  out(lines.join('\n'), { chains, openrouterToday: q.openrouter, stop: OPENROUTER_DAILY_STOP });
+}
+
 function cmdSkills() {
   const found = [];
   const root = path.join(HOME, '.claude', 'skills');
@@ -346,6 +426,7 @@ const table = {
   agents: cmdAgents,
   models: cmdModels,
   skills: cmdSkills,
+  chains: cmdChains,
   _worker: () => worker(pos[0]),
 };
 if (!table[cmd]) {
@@ -353,7 +434,10 @@ if (!table[cmd]) {
 
   offload oc <agent> "<prompt>" --dir <abs> [--model p/m] [--bg] [--skill name] [--timeout s] [--session id] [--no-context] [--json] [--full]
   offload agy "<model label>" "<prompt>" --dir <abs> [--bg] [--skill name] [--timeout s]
-  offload status [jobId] | abort <jobId> | health | agents | models | skills`);
+  offload status [jobId] | abort <jobId> | health | agents | models | skills | chains
+
+  oc lane fails over automatically across the tier's model chain (see 'chains');
+  disable with --no-fallback or by passing an explicit --model.`);
   process.exit(cmd ? 1 : 0);
 }
 await table[cmd]();
