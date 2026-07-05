@@ -38,11 +38,12 @@ For the `agy` lane, the `agy` CLI must be logged in and on PATH
 
 ```
 node offload.mjs health
+node offload.mjs role <name>          "<task>" --dir <abs-project-path> [--vs claude|gemini] [--bg] [--skill name]
 node offload.mjs oc  <agent>          "<task>" --dir <abs-project-path> [--model provider/model] [--bg] [--skill name] [--timeout s]
 node offload.mjs agy "<model label>"  "<task>" --dir <abs-project-path> [--bg] [--skill name] [--timeout s]
 node offload.mjs status [jobId]
 node offload.mjs abort <jobId>
-node offload.mjs agents | models | skills
+node offload.mjs agents | models | skills | chains | roles
 ```
 
 Flags: `--json` machine output · `--full` don't truncate · `--no-context`
@@ -91,6 +92,38 @@ as `via=` in the output. Chains are data (see `offload chains`), overridable
 per-tier in `config.json`; limited pools are guarded (a daily counter stops
 OpenRouter free-pool use at 45/50 shared). Disable with `--no-fallback`, or
 pass an explicit `--model` (your choice is respected, no chain).
+
+## Specialized roles (v1.2)
+
+`offload role <name> "<task>" --dir <abs> [--vs claude|gemini] [--bg] [--skill s]`
+
+A role = lane + primary model + role preamble + fallback, stored as data
+(`offload roles` to inspect; override per-role via `roles` in config.json).
+Design rules, each earned the hard way:
+
+- **One primary model per role, load spread across pools** — no single model
+  backs everything, so one pool incident degrades at most a role or two.
+- **Roles bind to chains, not single models** — an oc role's `roleModel`
+  *heads* the tier chain instead of disabling it (unlike an explicit
+  `--model`, which is respected verbatim). Models float; the role's promise
+  holds.
+- **Every fallback sits in a different quota pool than its primary.** Two
+  models sharing a rate limit are not backups for each other — they throttle
+  together. (Example: our agy lane is really 2 pools, not 6 models.)
+- **Review-type roles are propose-only** — reviewer/critic prompts
+  automatically include "PROPOSE ONLY — do NOT edit any files" (frontier
+  agents will happily apply fixes you only asked them to suggest).
+- **Cross-family critics** (`plan-critic`, `reviewer-hard`) pick the opposite
+  model family from the work's author (`--vs claude` → a Gemini reviews it),
+  because same-family review shares the author's blind spots.
+- **Same-lane fallback is automatic; cross-lane is suggested, not fired** —
+  the tool prints the exact fallback command and leaves the lane switch to
+  the orchestrator.
+- **Roles are earned by canary, not assigned by vacancy.** Every model's
+  first run through a role is verified from artifacts, not self-report. This
+  catches the worst failure mode: a model that returns plausible text while
+  editing nothing (a silent no-op) — invisible to failover, fatal in an
+  implementation role.
 
 ## Job model
 

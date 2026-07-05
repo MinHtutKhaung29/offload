@@ -28,7 +28,10 @@ const DEFAULTS = {
 // chain[0] documents the tier's configured primary; attempt 1 always runs the
 // agent's own default, so failover starts at chain[1].
 const CHAINS = {
-  build:   ['opencode/deepseek-v4-flash-free', 'opencode/mimo-v2.5-free', 'opencode/nemotron-3-ultra-free', 'cerebras/zai-glm-4.7', 'groq/llama-3.1-8b-instant', 'openrouter/nvidia/nemotron-3-super-120b-a12b:free'],
+  // zai-glm removed from build (implementation) chain 2026-07-06: silent no-op
+  // canary fail (writes nothing, returns plausible text). Kept in review chain
+  // — review output IS text, so the failure mode doesn't apply there.
+  build:   ['opencode/deepseek-v4-flash-free', 'opencode/mimo-v2.5-free', 'opencode/nemotron-3-ultra-free', 'groq/llama-3.1-8b-instant', 'openrouter/nvidia/nemotron-3-super-120b-a12b:free'],
   explore: ['opencode/deepseek-v4-flash-free', 'opencode/mimo-v2.5-free', 'groq/llama-3.1-8b-instant'],
   review:  ['opencode/north-mini-code-free', 'opencode/deepseek-v4-flash-free', 'cerebras/zai-glm-4.7'],
   plan:    ['google/gemini-3.1-pro-preview', 'opencode/mimo-v2.5-free'],
@@ -36,11 +39,64 @@ const CHAINS = {
 };
 const AGENT_TIER = {
   build: 'build', general: 'build', 'backend-developer': 'build', 'ecc-frontend-builder': 'build', 'refactor-cleaner': 'build',
-  explore: 'explore', 'docs-lookup': 'explore', librarian: 'explore',
-  'code-reviewer': 'review', architect: 'plan', planner: 'plan', 'security-reviewer': 'heavy',
+  explore: 'explore', 'docs-lookup': 'explore', librarian: 'explore', 'doc-updater': 'explore',
+  'code-reviewer': 'review', oracle: 'review', 'ecc-ui-reviewer': 'review',
+  architect: 'plan', planner: 'plan', 'security-reviewer': 'heavy',
+  'e2e-runner': 'build', 'build-error-resolver': 'build',
 };
 const MAX_ATTEMPTS = 3;
 const OPENROUTER_DAILY_STOP = 45; // pool is 50/day shared with agents we don't see
+
+// Specialized roles (v1.2) — one primary model per role, load spread across
+// pools, every fallback in a DIFFERENT pool. agy is 2 quota pools, not 6
+// models: 'gemini' (3.1 Pro + 3.5 Flash) and 'claude' (Opus + Sonnet +
+// GPT-OSS) — fallbacks must cross pools. oc roles ride the tier chains;
+// `roleModel` heads the chain (does not disable it, unlike user --model).
+// `noEdit` appends PROPOSE ONLY (agy agents edit files unasked — RULES.md #5).
+// `crossFamily` roles pick the opposite family of the work's author (--vs).
+const ROLES = {
+  planner:           { lane: 'agy', model: 'Gemini 3.1 Pro (High)', pool: 'gemini', fb: { lane: 'oc', agent: 'planner' },
+    pre: 'You are the PLANNER. Produce a concrete step-by-step implementation plan (files, order, risks, verification). Do NOT implement.' },
+  architect:         { lane: 'agy', model: 'Claude Opus 4.6 (Thinking)', pool: 'claude', fb: { lane: 'agy', model: 'Gemini 3.1 Pro (High)', pool: 'gemini' },
+    pre: 'You are the ARCHITECT. Design the system/structure: components, data flow, trade-offs, and decision rationale. Do NOT implement.' },
+  'plan-critic':     { lane: 'agy', crossFamily: true, defaultModel: 'GPT-OSS 120B (Medium)', pool: 'claude', noEdit: true, fb: { lane: 'oc', agent: 'oracle' },
+    pre: 'You are the PLAN CRITIC. Adversarially review the given plan: find flaws, risks, missing steps, and better alternatives.' },
+  researcher:        { lane: 'oc', agent: 'librarian', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (Low)', pool: 'gemini' },
+    pre: 'You are the RESEARCHER. Gather accurate information from docs/web/files and cite sources. Report findings only.' },
+  explorer:          { lane: 'oc', agent: 'explore',
+    pre: 'You are the EXPLORER. Locate and explain the code/files relevant to the question. Read-only reconnaissance; report paths and findings.' },
+  // NOTE: zai-glm-4.7 canary-FAILED as frontend primary 2026-07-06 (2/2 silent
+  // no-ops: returned a task restatement, edited nothing — undetectable by
+  // failover since output is non-empty). Do not give glm implementation roles.
+  frontend:          { lane: 'oc', agent: 'ecc-frontend-builder',
+    pre: 'You are the FRONTEND BUILDER. Implement UI/HTML/CSS/JS changes cleanly, matching the existing style and design tokens.' },
+  backend:           { lane: 'oc', agent: 'backend-developer',
+    pre: 'You are the BACKEND BUILDER. Implement server/API/data logic changes cleanly, with error handling.' },
+  'builder-careful': { lane: 'agy', model: 'Claude Sonnet 4.6 (Thinking)', pool: 'claude', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (High)', pool: 'gemini' },
+    pre: 'You are the CAREFUL BUILDER for risky multi-file changes. Think before editing, keep changes minimal and consistent, and re-check each edit.' },
+  reviewer:          { lane: 'oc', agent: 'code-reviewer', noEdit: true,
+    pre: 'You are the CODE REVIEWER. Review the given code/diff for bugs, quality, and maintainability; report findings ranked by severity.' },
+  'reviewer-hard':   { lane: 'agy', crossFamily: true, defaultModel: 'Claude Opus 4.6 (Thinking)', pool: 'claude', noEdit: true, fb: { lane: 'oc', agent: 'oracle' },
+    pre: 'You are the ADVERSARIAL REVIEWER for high-stakes work. Actively try to find what is wrong or risky; challenge assumptions.' },
+  security:          { lane: 'oc', agent: 'security-reviewer', noEdit: true, fb: { lane: 'agy', model: 'Claude Opus 4.6 (Thinking)', pool: 'claude' },
+    pre: 'You are the SECURITY REVIEWER. Audit for vulnerabilities (injection, auth, secrets, OWASP Top 10); report findings with severity.' },
+  'ui-critic':       { lane: 'oc', agent: 'ecc-ui-reviewer', noEdit: true,
+    pre: 'You are the UI CRITIC. Evaluate visual design, layout, and UX quality; report concrete issues and improvements.' },
+  tester:            { lane: 'oc', agent: 'e2e-runner',
+    pre: 'You are the TESTER. Write and/or run tests for the described behavior; report pass/fail with evidence.' },
+  'build-fixer':     { lane: 'oc', agent: 'build-error-resolver',
+    pre: 'You are the BUILD FIXER. Diagnose the build/test failure and apply the MINIMAL fix; do not refactor.' },
+  cleaner:           { lane: 'oc', agent: 'refactor-cleaner', roleModel: 'opencode/nemotron-3-ultra-free',
+    pre: 'You are the CLEANER. Remove dead code and tidy structure WITHOUT changing behavior.' },
+  'doc-writer':      { lane: 'oc', agent: 'doc-updater',
+    pre: 'You are the DOC WRITER. Write or update documentation to match reality; keep it concise and accurate.' },
+};
+// cross-family pick: the reviewer must be a different model family than the
+// work's author. --vs <family-of-author> selects the opposite side.
+const CROSS_FAMILY = {
+  claude: { model: 'Gemini 3.1 Pro (High)', pool: 'gemini' },
+  gemini: { model: 'Claude Opus 4.6 (Thinking)', pool: 'claude' },
+};
 
 fs.mkdirSync(JOBS, { recursive: true });
 const cfgPath = path.join(BASE, 'config.json');
@@ -108,8 +164,10 @@ function resolveSkill(name) {
   return null;
 }
 
-function buildPrompt(task, dir) {
+function buildPrompt(task, dir, role) {
   const lines = [];
+  if (role?.pre) lines.push(`ROLE: ${role.pre}`);
+  if (role?.noEdit) lines.push('PROPOSE ONLY — do NOT edit any files or run any state-changing commands. Output your analysis/proposals as text only.');
   lines.push(`You are working in the project directory: ${dir}`);
   lines.push('Read files directly at the given absolute paths — do NOT search the filesystem outside this directory.');
   const router = routerFor(dir);
@@ -133,7 +191,8 @@ function summarize(job, text) {
   const lines = (text || '').trim().split('\n');
   const excerpt = lines.length > 20 ? lines.slice(0, 20).join('\n') + `\n... (${lines.length - 20} more lines)` : lines.join('\n');
   const via = job.finalModel && job.finalModel !== '(agent default)' ? ` via=${job.finalModel}` : '';
-  const head = `[${job.id}] ${job.status} | lane=${job.lane} agent=${job.agent || job.model}${via} | full output: ${outFile(job.id)}`;
+  const role = job.role ? ` role=${job.role}` : '';
+  const head = `[${job.id}] ${job.status} | lane=${job.lane}${role} agent=${job.agent || job.model}${via} | full output: ${outFile(job.id)}`;
   if (opt.json) return { id: job.id, status: job.status, lane: job.lane, outFile: outFile(job.id), excerpt };
   return head + '\n' + (opt.full ? text : excerpt);
 }
@@ -225,20 +284,24 @@ async function runOcAttempt(job, modelStr) {
 }
 
 async function runOc(job) {
-  // model plan: explicit --model or --no-fallback = single attempt; otherwise
+  // model plan: explicit --model or --no-fallback = single attempt; a
+  // role-supplied model HEADS the chain (fallback stays active); otherwise
   // agent default first, then the tier chain (skipping chain[0] = the default)
   let models;
-  if (job.modelStr || opt['no-fallback']) models = [job.modelStr];
+  if (job.modelStr || opt['no-fallback']) models = [job.modelStr || job.roleModel];
   else {
     const chain = (cfg.chains || CHAINS)[AGENT_TIER[job.agent] || 'build'] || CHAINS.build;
     const orBlocked = quotaToday().openrouter >= OPENROUTER_DAILY_STOP;
-    models = [undefined, ...chain.slice(1).filter(m => {
-      if (orBlocked && m.startsWith('openrouter/')) {
+    const base = job.roleModel
+      ? [job.roleModel, ...chain.filter(m => m !== job.roleModel)]
+      : [undefined, ...chain.slice(1)];
+    models = base.filter(m => {
+      if (m && orBlocked && m.startsWith('openrouter/')) {
         console.error(`offload: skipping ${m} (OpenRouter free pool at ${quotaToday().openrouter}/day, stop=${OPENROUTER_DAILY_STOP})`);
         return false;
       }
       return true;
-    })].slice(0, MAX_ATTEMPTS);
+    }).slice(0, MAX_ATTEMPTS);
   }
 
   job.attempts = [];
@@ -264,11 +327,37 @@ async function runOc(job) {
   }
   job.status = job.attempts[job.attempts.length - 1]?.outcome === 'timeout' ? 'timeout' : 'error';
   saveJob(job);
-  throw new Error(`all ${job.attempts.length} attempt(s) failed [${job.attempts.map(a => `${a.model}:${a.outcome}`).join(', ')}]. Last: ${lastErr.message}. Check offload status ${job.id} before retrying.`);
+  const xlane = job.fb?.lane === 'agy' ? ` | cross-lane fallback (your call): offload agy "${job.fb.model}" "<task>" --dir ${job.dir}` : '';
+  throw new Error(`all ${job.attempts.length} attempt(s) failed [${job.attempts.map(a => `${a.model}:${a.outcome}`).join(', ')}]. Last: ${lastErr.message}. Check offload status ${job.id} before retrying.${xlane}`);
 }
 
 // ---------- agy lane ----------
+// same-LANE fallback only (agy -> agy across quota pools). Cross-lane
+// failover stays the orchestrator's decision — we print the exact command.
 function runAgy(job) {
+  try {
+    const text = runAgyOnce(job);
+    if (job.attempts) job.attempts.push({ model: job.model, outcome: 'ok' });
+    return text;
+  } catch (e) {
+    const outcome = job.status === 'quota' ? 'quota' : 'error';
+    if (job.fb?.lane === 'agy' && job.fb.model && job.fb.model !== job.model) {
+      (job.attempts ??= []).push({ model: job.model, outcome });
+      console.error(`offload: [${job.id}] ${job.model} failed (${outcome}) — failing over to ${job.fb.model} (cross-pool)`);
+      job.model = job.fb.model;
+      job.fb = undefined; // one same-lane retry only
+      job.status = 'running';
+      saveJob(job);
+      return runAgy(job);
+    }
+    if (job.fb?.lane === 'oc') {
+      e.message += ` | cross-lane fallback (your call): offload oc ${job.fb.agent} "<task>" --dir ${job.dir}`;
+    }
+    throw e;
+  }
+}
+
+function runAgyOnce(job) {
   const log = path.join(JOBS, job.id + '.agy.log');
   job.logFile = log;
   saveJob(job);
@@ -337,6 +426,10 @@ async function cmdRun(lane) {
     skills: opt.skill,
   };
   saveJob(job);
+  return execJob(job);
+}
+
+async function execJob(job) {
   if (opt.bg) return detach(job);
   try {
     const text = job.lane === 'oc' ? await runOc(job) : runAgy(job);
@@ -346,6 +439,53 @@ async function cmdRun(lane) {
     saveJob(job);
     die(`[${job.id}] ${e.message}`);
   }
+}
+
+// ---------- role command (v1.2 specialized agents) ----------
+async function cmdRole() {
+  const roles = { ...ROLES, ...(cfg.roles || {}) };
+  const [name, ...rest] = pos;
+  const role = roles[name];
+  if (!role) die(`unknown role: ${name || '(none)'}. Available: ${Object.keys(roles).join(', ')}`);
+  const dir = opt.dir && path.resolve(opt.dir);
+  if (!dir) die('--dir <absolute project path> is required');
+  if (!fs.existsSync(dir)) die('--dir does not exist: ' + dir);
+  const task = rest.join(' ');
+  if (!task) die(`usage: offload role ${name} "<prompt>" --dir <abs> [--bg] [--skill s] [--vs claude|gemini] [--timeout s]`);
+
+  let agyModel = role.model;
+  if (role.crossFamily) {
+    const pick = opt.vs && CROSS_FAMILY[opt.vs];
+    if (opt.vs && !pick) die('--vs must be claude or gemini (the family that AUTHORED the work under review)');
+    agyModel = pick ? pick.model : role.defaultModel;
+  }
+
+  const job = {
+    id: newId(), lane: role.lane, dir, status: 'running', created: now(),
+    role: name,
+    agent: role.lane === 'oc' ? role.agent : undefined,
+    model: role.lane === 'agy' ? agyModel : undefined,
+    roleModel: role.lane === 'oc' ? role.roleModel : undefined,
+    fb: role.fb,
+    timeout: opt.timeout,
+    attempts: [],
+    task: task.slice(0, 200),
+    fullPrompt: buildPrompt(task, dir, role),
+    skills: opt.skill,
+  };
+  saveJob(job);
+  return execJob(job);
+}
+
+function cmdRoles() {
+  const roles = { ...ROLES, ...(cfg.roles || {}) };
+  const lines = Object.entries(roles).map(([n, r]) => {
+    const primary = r.lane === 'agy' ? (r.crossFamily ? `cross-family (default ${r.defaultModel})` : r.model)
+      : `${r.agent}${r.roleModel ? ` @ ${r.roleModel}` : ' (agent default + tier chain)'}`;
+    const fb = r.fb ? (r.fb.lane === 'agy' ? `agy ${r.fb.model}` : `oc ${r.fb.agent} (manual)`) : 'tier chain';
+    return `${n.padEnd(16)} ${r.lane.padEnd(4)} ${primary.padEnd(48)} fb: ${fb}${r.noEdit ? '  [propose-only]' : ''}`;
+  });
+  out(lines.join('\n'), roles);
 }
 
 async function cmdStatus() {
@@ -420,6 +560,8 @@ function cmdSkills() {
 const table = {
   oc: () => cmdRun('oc'),
   agy: () => cmdRun('agy'),
+  role: cmdRole,
+  roles: cmdRoles,
   status: cmdStatus,
   abort: cmdAbort,
   health: cmdHealth,
@@ -432,10 +574,12 @@ const table = {
 if (!table[cmd]) {
   console.log(`offload — run subagent work on free/external models (save Claude tokens)
 
+  offload role <name> "<prompt>" --dir <abs> [--bg] [--skill name] [--vs claude|gemini] [--timeout s]
   offload oc <agent> "<prompt>" --dir <abs> [--model p/m] [--bg] [--skill name] [--timeout s] [--session id] [--no-context] [--json] [--full]
   offload agy "<model label>" "<prompt>" --dir <abs> [--bg] [--skill name] [--timeout s]
-  offload status [jobId] | abort <jobId> | health | agents | models | skills | chains
+  offload status [jobId] | abort <jobId> | health | agents | models | skills | chains | roles
 
+  'role' = specialized agents with per-role model routing + fallback (see 'roles').
   oc lane fails over automatically across the tier's model chain (see 'chains');
   disable with --no-fallback or by passing an explicit --model.`);
   process.exit(cmd ? 1 : 0);
