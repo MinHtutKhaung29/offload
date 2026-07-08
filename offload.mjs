@@ -33,7 +33,9 @@ const CHAINS = {
   // — review output IS text, so the failure mode doesn't apply there.
   build:   ['opencode/deepseek-v4-flash-free', 'opencode/mimo-v2.5-free', 'opencode/nemotron-3-ultra-free', 'groq/llama-3.1-8b-instant', 'openrouter/nvidia/nemotron-3-super-120b-a12b:free'],
   explore: ['opencode/deepseek-v4-flash-free', 'opencode/mimo-v2.5-free', 'groq/llama-3.1-8b-instant'],
-  review:  ['opencode/north-mini-code-free', 'opencode/deepseek-v4-flash-free', 'cerebras/zai-glm-4.7'],
+  // north-mini-code-free REMOVED 2026-07-08: canary-confirmed dead (2/2 probes,
+  // zero output parts on trivial PONG, empty completion) — do not re-add without retest.
+  review:  ['opencode/deepseek-v4-flash-free', 'cerebras/zai-glm-4.7'],
   plan:    ['google/gemini-3.1-pro-preview', 'opencode/mimo-v2.5-free'],
   heavy:   ['nvidia/deepseek-ai/deepseek-v4-pro', 'google/gemini-3.1-pro-preview'],
 };
@@ -41,7 +43,7 @@ const AGENT_TIER = {
   build: 'build', general: 'build', 'backend-developer': 'build', 'ecc-frontend-builder': 'build', 'refactor-cleaner': 'build',
   explore: 'explore', 'docs-lookup': 'explore', librarian: 'explore', 'doc-updater': 'explore',
   'code-reviewer': 'review', oracle: 'review', 'ecc-ui-reviewer': 'review',
-  architect: 'plan', planner: 'plan', 'security-reviewer': 'heavy',
+  planner: 'plan', 'security-reviewer': 'heavy',
   'e2e-runner': 'build', 'build-error-resolver': 'build',
 };
 const MAX_ATTEMPTS = 3;
@@ -54,42 +56,66 @@ const OPENROUTER_DAILY_STOP = 45; // pool is 50/day shared with agents we don't 
 // `roleModel` heads the chain (does not disable it, unlike user --model).
 // `noEdit` appends PROPOSE ONLY (agy agents edit files unasked — RULES.md #5).
 // `crossFamily` roles pick the opposite family of the work's author (--vs).
+// Full self-contained researcher spec for the AGY lane. agy has no agent-file
+// mechanism (unlike oc's agents/researcher.md), so the one-shot prompt IS the
+// whole agent — this embeds the SAME specialization the oc agent file carries
+// (methodology, provenance, output contract), one-shot-CLI-optimized per the
+// 2026-07-08 agent-design research: absolute paths, explicit output contract,
+// hard stop condition. Tool guidance differs from oc: agy Gemini reads PDFs
+// NATIVELY (no pypdf step). Keep this in sync with agents/researcher.md.
+const RESEARCHER_SPEC_AGY = [
+  'RESEARCHER. Process over conclusions: every claim traced, confidence calibrated, contradictions reported.',
+  'Before start: check skills library, invoke relevant skill. Don\'t wait for skill name.',
+  'WORKFLOW: (1) FRAME question(s), one sentence each, state scope. (2) GATHER 3+ independent sources, different types; follow references in best sources; never skip a contradicting source. (3) ASSESS each source HIGH/MEDIUM/LOW (authority, recency, purpose); Wikipedia/AI summaries = navigation only, never cite as evidence. (4) EXTRACT own words but copy numbers/dates/caveats VERBATIM; record source+location per claim. (5) SYNTHESIZE by THEME not source; state agreement/disagreement + conditions. (6) WRITE file, stop.',
+  'WEB READING: prefer `firecrawl scrape "<url>"` (clean markdown, handles JS) over plain fetch; `firecrawl search "<query>"` = search+content in one call. Fallback: native fetch on firecrawl error. Cite page, never snippet.',
+  'PDFs/books: read natively, FULLY, chunked if long, running notes. Never summarize from partial read.',
+  'OUTPUT: ONE markdown file at given absolute path. Create exactly there, no filesystem search. Sections: Question & scope / Summary (BLUF) / Findings by theme (claim -> citation [source, title, date, URL] -> confidence HIGH|MODERATE|LOW|SPECULATIVE) / Contradictions & open questions / Limitations / Sources (list + retrieval date). Exclude raw snippets, tool logs, speculation-as-fact. Never "proves" without 2+ independent HIGH sources.',
+  'BOUNDARIES: no edits except findings file. No build/git/install commands. No sub-agents. Code edits/decisions needed -> stop, report "out of researcher scope".',
+  'DONE WHEN: findings file exists, all sections populated, every claim cited. Final message: 3-5 line summary + file path. Nothing else.',
+].join('\n');
+
 const ROLES = {
   planner:           { lane: 'agy', model: 'Gemini 3.1 Pro (High)', pool: 'gemini', fb: { lane: 'oc', agent: 'planner' },
-    pre: 'You are the PLANNER. Produce a concrete step-by-step implementation plan (files, order, risks, verification). Do NOT implement.' },
-  architect:         { lane: 'agy', model: 'Claude Opus 4.6 (Thinking)', pool: 'claude', fb: { lane: 'agy', model: 'Gemini 3.1 Pro (High)', pool: 'gemini' },
-    pre: 'You are the ARCHITECT. Design the system/structure: components, data flow, trade-offs, and decision rationale. Do NOT implement.' },
+    pre: 'PLANNER. Concrete step-by-step implementation plan: files, order, risks, verification. No implementation.' },
   'plan-critic':     { lane: 'agy', crossFamily: true, defaultModel: 'GPT-OSS 120B (Medium)', pool: 'claude', noEdit: true, fb: { lane: 'oc', agent: 'oracle' },
-    pre: 'You are the PLAN CRITIC. Adversarially review the given plan: find flaws, risks, missing steps, and better alternatives.' },
-  researcher:        { lane: 'oc', agent: 'librarian', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (Low)', pool: 'gemini' },
-    pre: 'You are the RESEARCHER. Gather accurate information from docs/web/files and cite sources. Report findings only.' },
+    pre: 'PLAN CRITIC. Adversarial review: find flaws, risks, missing steps, better alternatives.' },
+  // researcher rebuilt 2026-07-08: dedicated agents/researcher.md (Nemotron 3 Ultra
+  // primary — canary-passed PDF extraction 2/2; least-loaded Zen model). Fan-out
+  // pattern: researcher + researcher2 (DeepSeek Flash) + researcher3 (agy Gemini,
+  // native PDF) = 3 model families, load spread across pools.
+  researcher:        { lane: 'oc', agent: 'researcher', roleModel: 'opencode/nemotron-3-ultra-free', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (Low)', pool: 'gemini' },
+    pre: 'RESEARCHER. Task: one sentence first, then details. Rules: cite every claim inline (source, date, URL); confidence HIGH/MODERATE/LOW; report contradictions, never false consensus; copy numbers verbatim; synthesize by theme not source; write ONE findings markdown file at given path, stop. No edits to existing files. PDFs: extract via python pypdf to <name>_extracted.txt, read that; empty extraction = scanned, report "needs vision lane", move on.' },
+  researcher2:       { lane: 'oc', agent: 'researcher', roleModel: 'opencode/deepseek-v4-flash-free', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (Low)', pool: 'gemini' },
+    pre: 'RESEARCHER. Task: one sentence first, then details. Rules: cite every claim inline (source, date, URL); confidence HIGH/MODERATE/LOW; report contradictions, never false consensus; copy numbers verbatim; synthesize by theme not source; write ONE findings markdown file at given path, stop. No edits to existing files. PDFs: extract via python pypdf to <name>_extracted.txt, read that; empty extraction = scanned, report "needs vision lane", move on.' },
+  researcher3:       { lane: 'agy', model: 'Gemini 3.5 Flash (Medium)', pool: 'gemini', fb: { lane: 'oc', agent: 'researcher' },
+    pre: RESEARCHER_SPEC_AGY },
   explorer:          { lane: 'oc', agent: 'explore',
-    pre: 'You are the EXPLORER. Locate and explain the code/files relevant to the question. Read-only reconnaissance; report paths and findings.' },
+    pre: 'EXPLORER. Locate and explain code/files relevant to question. Read-only. Report paths + findings.' },
   // NOTE: zai-glm-4.7 canary-FAILED as frontend primary 2026-07-06 (2/2 silent
   // no-ops: returned a task restatement, edited nothing — undetectable by
   // failover since output is non-empty). Do not give glm implementation roles.
   frontend:          { lane: 'oc', agent: 'ecc-frontend-builder',
-    pre: 'You are the FRONTEND BUILDER. Implement UI/HTML/CSS/JS changes cleanly, matching the existing style and design tokens.' },
+    pre: 'FRONTEND BUILDER. Implement UI/HTML/CSS/JS changes. Match existing style, design tokens.' },
   backend:           { lane: 'oc', agent: 'backend-developer',
-    pre: 'You are the BACKEND BUILDER. Implement server/API/data logic changes cleanly, with error handling.' },
+    pre: 'BACKEND BUILDER. Implement server/API/data logic changes. Include error handling.' },
   'builder-careful': { lane: 'agy', model: 'Claude Sonnet 4.6 (Thinking)', pool: 'claude', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (High)', pool: 'gemini' },
-    pre: 'You are the CAREFUL BUILDER for risky multi-file changes. Think before editing, keep changes minimal and consistent, and re-check each edit.' },
+    pre: 'CAREFUL BUILDER. Risky multi-file changes. Think before edit. Minimal, consistent changes. Re-check each edit.' },
   reviewer:          { lane: 'oc', agent: 'code-reviewer', noEdit: true,
-    pre: 'You are the CODE REVIEWER. Review the given code/diff for bugs, quality, and maintainability; report findings ranked by severity.' },
+    pre: 'CODE REVIEWER. Review code/diff: bugs, quality, maintainability. Report findings ranked by severity.' },
   'reviewer-hard':   { lane: 'agy', crossFamily: true, defaultModel: 'Claude Opus 4.6 (Thinking)', pool: 'claude', noEdit: true, fb: { lane: 'oc', agent: 'oracle' },
-    pre: 'You are the ADVERSARIAL REVIEWER for high-stakes work. Actively try to find what is wrong or risky; challenge assumptions.' },
+    pre: 'ADVERSARIAL REVIEWER. High-stakes work. Actively find what\'s wrong or risky. Challenge assumptions.' },
   security:          { lane: 'oc', agent: 'security-reviewer', noEdit: true, fb: { lane: 'agy', model: 'Claude Opus 4.6 (Thinking)', pool: 'claude' },
-    pre: 'You are the SECURITY REVIEWER. Audit for vulnerabilities (injection, auth, secrets, OWASP Top 10); report findings with severity.' },
+    pre: 'SECURITY REVIEWER. Audit vulnerabilities: injection, auth, secrets, OWASP Top 10. Report findings with severity.' },
   'ui-critic':       { lane: 'oc', agent: 'ecc-ui-reviewer', noEdit: true,
-    pre: 'You are the UI CRITIC. Evaluate visual design, layout, and UX quality; report concrete issues and improvements.' },
+    pre: 'UI CRITIC. Evaluate visual design, layout, UX quality. Report concrete issues + improvements.' },
   tester:            { lane: 'oc', agent: 'e2e-runner',
-    pre: 'You are the TESTER. Write and/or run tests for the described behavior; report pass/fail with evidence.' },
+    pre: 'TESTER. Write and/or run tests for described behavior. Report pass/fail with evidence.' },
   'build-fixer':     { lane: 'oc', agent: 'build-error-resolver',
-    pre: 'You are the BUILD FIXER. Diagnose the build/test failure and apply the MINIMAL fix; do not refactor.' },
+    pre: 'BUILD FIXER. Diagnose build/test failure. Apply MINIMAL fix. No refactor.' },
   cleaner:           { lane: 'oc', agent: 'refactor-cleaner', roleModel: 'opencode/nemotron-3-ultra-free',
-    pre: 'You are the CLEANER. Remove dead code and tidy structure WITHOUT changing behavior.' },
+    pre: 'CLEANER. Remove dead code, tidy structure. No behavior change.' },
   'doc-writer':      { lane: 'oc', agent: 'doc-updater',
-    pre: 'You are the DOC WRITER. Write or update documentation to match reality; keep it concise and accurate.' },
+    pre: 'DOC WRITER. Write/update docs to match reality. Concise, accurate.' },
 };
 // cross-family pick: the reviewer must be a different model family than the
 // work's author. --vs <family-of-author> selects the opposite side.
@@ -113,7 +139,7 @@ const pos = [];
 const opt = { skill: [] };
 for (let i = 1; i < argv.length; i++) {
   const a = argv[i];
-  if (a === '--bg' || a === '--json' || a === '--full' || a === '--no-context') opt[a.slice(2)] = true;
+  if (a === '--bg' || a === '--json' || a === '--full' || a === '--no-context' || a === '--no-fallback') opt[a.slice(2)] = true;
   else if (a === '--skill') opt.skill.push(argv[++i]);
   else if (a.startsWith('--')) opt[a.slice(2)] = argv[++i];
   else pos.push(a);
@@ -167,21 +193,21 @@ function resolveSkill(name) {
 function buildPrompt(task, dir, role) {
   const lines = [];
   if (role?.pre) lines.push(`ROLE: ${role.pre}`);
-  if (role?.noEdit) lines.push('PROPOSE ONLY — do NOT edit any files or run any state-changing commands. Output your analysis/proposals as text only.');
-  lines.push(`You are working in the project directory: ${dir}`);
-  lines.push('Read files directly at the given absolute paths — do NOT search the filesystem outside this directory.');
+  if (role?.noEdit) lines.push('PROPOSE ONLY. No file edits, no state-changing commands. Text output only.');
+  lines.push(`Project dir: ${dir}`);
+  lines.push('Read files at given absolute paths directly. No filesystem search outside this dir.');
   const router = routerFor(dir);
-  if (router) lines.push(`Before starting, read the project router at: ${router} — it describes the project purpose, folder structure, plans, and current state. Let it guide your work.`);
+  if (router) lines.push(`Read project router first: ${router} — purpose, structure, plans, current state. Follow it.`);
   for (const s of opt.skill) {
     const p = resolveSkill(s);
     if (!p) die(`skill not found in Claude library: ${s}`);
-    lines.push(`Apply the skill/checklist at: ${p} — read it first and follow it for this task.`);
+    lines.push(`Invoke ${s} skill. Also read: ${p}. Apply it.`);
   }
   lines.push('');
   lines.push('TASK:');
   lines.push(task);
   lines.push('');
-  lines.push('Do this task YOURSELF — do NOT spawn sub-agents or use any task/delegate tool. Keep each step short.');
+  lines.push('Do this yourself. No sub-agents, no delegate tool. Short steps.');
   return lines.join('\n');
 }
 
@@ -192,9 +218,44 @@ function summarize(job, text) {
   const excerpt = lines.length > 20 ? lines.slice(0, 20).join('\n') + `\n... (${lines.length - 20} more lines)` : lines.join('\n');
   const via = job.finalModel && job.finalModel !== '(agent default)' ? ` via=${job.finalModel}` : '';
   const role = job.role ? ` role=${job.role}` : '';
-  const head = `[${job.id}] ${job.status} | lane=${job.lane}${role} agent=${job.agent || job.model}${via} | full output: ${outFile(job.id)}`;
-  if (opt.json) return { id: job.id, status: job.status, lane: job.lane, outFile: outFile(job.id), excerpt };
+  const head = `[${job.id}] ${job.status} | lane=${job.lane}${role} agent=${job.agent || job.model}${via} | full output: ${outFile(job.id)}`
+    + (job.verifyNote ? `\n${job.verifyNote}` : '');
+  if (opt.json) return { id: job.id, status: job.status, lane: job.lane, verify: job.verifyNote, outFile: outFile(job.id), excerpt };
   return head + '\n' + (opt.full ? text : excerpt);
+}
+
+// ---------- verification (evidence, not self-report) ----------
+// Snapshot `git status --porcelain` at job creation; diff it after completion.
+// Catches: no-edit agents that edited anyway (mimo 2026-07-08), and "silent
+// no-op" builders that report success but changed nothing (zai-glm class).
+function gitSnapshot(dir) {
+  const r = spawnSync('git', ['status', '--porcelain'], { cwd: dir, encoding: 'utf8', timeout: 15000 });
+  return r.status === 0 ? (r.stdout || '') : null; // null = not a git repo
+}
+const EDIT_ROLES_HINT = /build|fix|clean|frontend|backend|doc-writer|tester/;
+// New porcelain lines since job creation (files the job created/modified).
+// [] when not a git repo or on snapshot failure — caller can't distinguish
+// "no changes" from "can't tell", so only use this to CONFIRM a write, never
+// to assert none happened.
+function changedFiles(job) {
+  if (job.gitBefore == null) return [];
+  const after = gitSnapshot(job.dir);
+  if (after == null) return [];
+  const before = new Set(job.gitBefore.split('\n').filter(Boolean));
+  return after.split('\n').filter(Boolean).filter(l => !before.has(l));
+}
+function verifyJob(job) {
+  if (job.gitBefore == null) return; // not a repo — nothing to check
+  if (gitSnapshot(job.dir) == null) return;
+  const changed = changedFiles(job);
+  job.filesChanged = changed;
+  if (job.noEdit && changed.length) {
+    job.verifyNote = `⚠️ VERIFY: agent MODIFIED FILES despite propose-only: ${changed.slice(0, 5).join(' | ')}${changed.length > 5 ? ` (+${changed.length - 5} more)` : ''} — inspect/revert before trusting the report`;
+  } else if (!job.noEdit && !changed.length && EDIT_ROLES_HINT.test(job.role || job.agent || '')) {
+    job.verifyNote = '⚠️ VERIFY: implementation-type job finished with ZERO file changes — possible silent no-op; check the output against reality';
+  } else if (changed.length) {
+    job.verifyNote = `verify: ${changed.length} file(s) changed: ${changed.slice(0, 5).join(' | ')}${changed.length > 5 ? ' …' : ''}`;
+  }
 }
 
 // ---------- oc lane ----------
@@ -216,6 +277,32 @@ function parseModel(s) {
   const i = s.indexOf('/');
   if (i < 0) die('--model must be providerID/modelID');
   return { providerID: s.slice(0, i), modelID: s.slice(i + 1) };
+}
+
+// live diagnosis for a session: what tool is it stuck in, and is a
+// permission ask pending? (the 2026-07-08 external_directory hang looked
+// like 9 model failures until this info was pulled out by hand)
+async function liveState(job) {
+  const bits = [];
+  try {
+    const perms = await api('GET', '/permission', null, { directory: job.dir });
+    const mine = (perms || []).filter(p => !job.sessionId || p.sessionID === job.sessionId);
+    for (const p of mine.slice(0, 2))
+      bits.push(`⏸ BLOCKED: pending "${p.permission}" permission ask (${(p.patterns || []).join(', ')}) — headless serve cannot approve; fix opencode.jsonc permission config`);
+  } catch { /* endpoint absent on older serve */ }
+  try {
+    const msgs = await api('GET', `/session/${job.sessionId}/message`, null, { directory: job.dir });
+    const last = msgs.filter(m => m.info?.role === 'assistant').pop();
+    const tools = (last?.parts || []).filter(p => p.type === 'tool');
+    const open = tools.find(t => t.state?.status && t.state.status !== 'completed');
+    if (open) {
+      const secs = open.state?.time?.start ? Math.round((Date.now() - open.state.time.start) / 1000) : '?';
+      bits.push(`⏳ in tool "${open.tool}" (${open.state.status}, ${secs}s) input=${JSON.stringify(open.state?.input || {}).slice(0, 120)}`);
+    } else if (last && !last.info?.time?.completed) {
+      bits.push(`⏳ generating (parts: ${(last.parts || []).map(p => p.type).join(',') || 'none yet'})`);
+    }
+  } catch { /* ignore */ }
+  return bits.join('\n');
 }
 
 function textParts(msgs) {
@@ -243,6 +330,11 @@ function bumpQuota(model) {
   const q = quotaToday();
   q.openrouter++;
   fs.writeFileSync(quotaFile, JSON.stringify(q));
+}
+
+async function diagSuffix(job) {
+  const d = await liveState(job);
+  return d ? ` — DIAGNOSIS: ${d.replace(/\n/g, ' | ')}` : '';
 }
 
 // one delegation attempt; throws typed errors so the failover loop can decide
@@ -275,11 +367,20 @@ async function runOcAttempt(job, modelStr) {
     if (sig !== lastSig) { lastSig = sig; lastChange = Date.now(); }
     if (last?.info?.time?.completed) {
       const text = textParts(msgs);
-      if (!text.trim()) { const e = new Error('empty response'); e.kind = 'empty'; throw e; }
+      if (!text.trim()) {
+        // Some models (e.g. Nemotron 3 Ultra) end a turn on a terminal tool
+        // call — they do the work and write the output file but emit no closing
+        // text part. Treat that as success IF a file actually appeared, so the
+        // real deliverable isn't discarded as "empty". Only trusts a positive
+        // git signal; a non-repo dir still counts as empty (can't confirm).
+        const wrote = changedFiles(job);
+        if (wrote.length) return `(no chat summary emitted; wrote ${wrote.length} file(s): ${wrote.slice(0, 3).map(l => l.replace(/^\s*\S+\s+/, '')).join(' | ')})`;
+        const e = new Error('empty response'); e.kind = 'empty'; throw e;
+      }
       return text;
     }
-    if (Date.now() - lastChange > staleMs) { const e = new Error(`no session activity for ${staleMs / 1000}s`); e.kind = 'stale'; throw e; }
-    if (Date.now() - start > timeoutMs) { const e = new Error(`no completion after ${timeoutMs / 1000}s`); e.kind = 'timeout'; throw e; }
+    if (Date.now() - lastChange > staleMs) { const e = new Error(`no session activity for ${staleMs / 1000}s${await diagSuffix(job)}`); e.kind = 'stale'; throw e; }
+    if (Date.now() - start > timeoutMs) { const e = new Error(`no completion after ${timeoutMs / 1000}s${await diagSuffix(job)}`); e.kind = 'timeout'; throw e; }
   }
 }
 
@@ -288,7 +389,7 @@ async function runOc(job) {
   // role-supplied model HEADS the chain (fallback stays active); otherwise
   // agent default first, then the tier chain (skipping chain[0] = the default)
   let models;
-  if (job.modelStr || opt['no-fallback']) models = [job.modelStr || job.roleModel];
+  if (job.modelStr || job.noFallback) models = [job.modelStr || job.roleModel];
   else {
     const chain = (cfg.chains || CHAINS)[AGENT_TIER[job.agent] || 'build'] || CHAINS.build;
     const orBlocked = quotaToday().openrouter >= OPENROUTER_DAILY_STOP;
@@ -341,7 +442,7 @@ function runAgy(job) {
     return text;
   } catch (e) {
     const outcome = job.status === 'quota' ? 'quota' : 'error';
-    if (job.fb?.lane === 'agy' && job.fb.model && job.fb.model !== job.model) {
+    if (!job.noFallback && job.fb?.lane === 'agy' && job.fb.model && job.fb.model !== job.model) {
       (job.attempts ??= []).push({ model: job.model, outcome });
       console.error(`offload: [${job.id}] ${job.model} failed (${outcome}) — failing over to ${job.fb.model} (cross-pool)`);
       job.model = job.fb.model;
@@ -397,6 +498,7 @@ async function worker(id) {
     const text = job.lane === 'oc' ? await runOc(job) : runAgy(job);
     fs.writeFileSync(outFile(job.id), text || '(empty response)');
     job.status = 'done';
+    verifyJob(job);
   } catch (e) {
     if (job.status === 'running') job.status = 'error';
     job.error = String(e.message || e);
@@ -421,9 +523,12 @@ async function cmdRun(lane) {
     model: lane === 'agy' ? target : opt.model,
     modelStr: lane === 'oc' ? opt.model : undefined,
     sessionId: opt.session, timeout: opt.timeout,
+    noFallback: !!opt['no-fallback'],
     task: task.slice(0, 200),
     fullPrompt: buildPrompt(task, dir),
     skills: opt.skill,
+    noEdit: /propose only|do not edit|don't edit/i.test(task),
+    gitBefore: gitSnapshot(dir),
   };
   saveJob(job);
   return execJob(job);
@@ -433,7 +538,9 @@ async function execJob(job) {
   if (opt.bg) return detach(job);
   try {
     const text = job.lane === 'oc' ? await runOc(job) : runAgy(job);
-    job.status = 'done'; saveJob(job);
+    job.status = 'done';
+    verifyJob(job);
+    saveJob(job);
     out(summarize(job, text));
   } catch (e) {
     saveJob(job);
@@ -468,10 +575,13 @@ async function cmdRole() {
     roleModel: role.lane === 'oc' ? role.roleModel : undefined,
     fb: role.fb,
     timeout: opt.timeout,
+    noFallback: !!opt['no-fallback'],
     attempts: [],
     task: task.slice(0, 200),
     fullPrompt: buildPrompt(task, dir, role),
     skills: opt.skill,
+    noEdit: !!role.noEdit || /propose only|do not edit|don't edit/i.test(task),
+    gitBefore: gitSnapshot(dir),
   };
   saveJob(job);
   return execJob(job);
@@ -500,11 +610,16 @@ async function cmdStatus() {
         if (last?.info?.time?.completed) {
           j.status = 'done';
           fs.writeFileSync(outFile(j.id), textParts(msgs));
+          verifyJob(j);
           saveJob(j);
         } else j.liveMessageCount = msgs.length;
       } catch { /* server unreachable; report stored state */ }
     }
-    const text = fs.existsSync(outFile(id)) ? fs.readFileSync(outFile(id), 'utf8') : '(no output yet)';
+    let text = fs.existsSync(outFile(id)) ? fs.readFileSync(outFile(id), 'utf8') : '(no output yet)';
+    if (j.status === 'running' && j.lane === 'oc' && j.sessionId) {
+      const d = await liveState(j);
+      if (d) text = d + '\n' + text;
+    }
     return out(summarize(j, text), { ...j, excerpt: text.split('\n').slice(0, 20).join('\n') });
   }
   const rows = allJobs().slice(0, 15).map(j =>
