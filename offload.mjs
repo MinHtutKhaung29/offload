@@ -41,7 +41,7 @@ const CHAINS = {
 };
 const AGENT_TIER = {
   build: 'build', general: 'build', 'backend-developer': 'build', 'ecc-frontend-builder': 'build', 'refactor-cleaner': 'build',
-  explore: 'explore', 'docs-lookup': 'explore', librarian: 'explore', 'doc-updater': 'explore',
+  explore: 'explore', 'docs-lookup': 'explore', 'doc-updater': 'explore',
   'code-reviewer': 'review', oracle: 'review', 'ecc-ui-reviewer': 'review',
   planner: 'plan', 'security-reviewer': 'heavy',
   'e2e-runner': 'build', 'build-error-resolver': 'build',
