@@ -1,3 +1,4 @@
 jobs/
 config.json
 projects.json
+*.log
