@@ -4,7 +4,7 @@ Run coding-agent subtasks on **free/cheap external models** instead of burning
 your Claude Code (or other paid-CLI) quota — with the guardrails that make
 delegation actually reliable.
 
-One ~350-line Node script. No dependencies, no MCP server. Two lanes:
+One ~700-line Node script. No dependencies, no MCP server. Two lanes:
 
 - **`oc`** — [opencode](https://opencode.ai) `serve` HTTP API (async, model failover)
 - **`agy`** — [Google Antigravity](https://antigravity.google) CLI one-shots (Gemini / Claude / GPT-OSS)
@@ -65,7 +65,7 @@ node offload.mjs status [jobId] | abort <jobId>
 node offload.mjs agents | models | skills | chains | roles
 ```
 
-Flags: `--json` · `--full` (no truncate) · `--no-context` · `--session <id>` · `--router <path>`.
+Flags: `--json` · `--full` (no truncate) · `--no-context` · `--router <path>`.
 
 ## Guardrails (each maps to a real incident)
 

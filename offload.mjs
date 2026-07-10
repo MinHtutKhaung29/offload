@@ -133,15 +133,21 @@ const projPath = path.join(BASE, 'projects.json');
 const projects = fs.existsSync(projPath) ? JSON.parse(fs.readFileSync(projPath, 'utf8')) : {};
 
 // ---------- arg parsing ----------
+const BOOL_FLAGS = new Set(['bg', 'json', 'full', 'no-context', 'no-fallback']);
+const VALUE_FLAGS = new Set(['model', 'dir', 'timeout', 'router', 'vs']);
 const argv = process.argv.slice(2);
 const cmd = argv[0];
 const pos = [];
 const opt = { skill: [] };
 for (let i = 1; i < argv.length; i++) {
   const a = argv[i];
-  if (a === '--bg' || a === '--json' || a === '--full' || a === '--no-context' || a === '--no-fallback') opt[a.slice(2)] = true;
-  else if (a === '--skill') opt.skill.push(argv[++i]);
-  else if (a.startsWith('--')) opt[a.slice(2)] = argv[++i];
+  if (a === '--skill') opt.skill.push(argv[++i]);
+  else if (a.startsWith('--')) {
+    const name = a.slice(2);
+    if (BOOL_FLAGS.has(name)) opt[name] = true;
+    else if (VALUE_FLAGS.has(name)) opt[name] = argv[++i];
+    else die(`unknown flag: ${a}`);
+  }
   else pos.push(a);
 }
 
@@ -156,7 +162,10 @@ const newId = () => 'job_' + Date.now().toString(36) + Math.random().toString(36
 const jobFile = (id) => path.join(JOBS, id + '.json');
 const outFile = (id) => path.join(JOBS, id + '.out.md');
 function saveJob(j) { j.updated = now(); fs.writeFileSync(jobFile(j.id), JSON.stringify(j, null, 2)); }
-function loadJob(id) { return JSON.parse(fs.readFileSync(jobFile(id), 'utf8')); }
+function loadJob(id) {
+  if (!fs.existsSync(jobFile(id))) die(`no such job: ${id}`);
+  return JSON.parse(fs.readFileSync(jobFile(id), 'utf8'));
+}
 function allJobs() {
   return fs.readdirSync(JOBS).filter(f => f.endsWith('.json'))
     .map(f => JSON.parse(fs.readFileSync(path.join(JOBS, f), 'utf8')))
@@ -409,6 +418,9 @@ async function runOc(job) {
   let lastErr;
   for (const m of models) {
     const label = m || '(agent default)';
+    // re-snapshot before each attempt so verifyJob only credits THIS attempt's
+    // edits, not leftovers from a prior failed attempt in the same failover chain.
+    job.gitBefore = gitSnapshot(job.dir);
     try {
       const text = await runOcAttempt(job, m);
       job.attempts.push({ model: label, outcome: 'ok' });
@@ -515,14 +527,14 @@ async function cmdRun(lane) {
   const [target, ...rest] = pos; // oc: agent name | agy: model label
   const task = rest.join(' ');
   if (!target || !task) die(lane === 'oc'
-    ? 'usage: offload oc <agent> "<prompt>" --dir <abs> [--model p/m] [--bg] [--skill name]'
+    ? 'usage: offload oc <agent> "<prompt>" --dir <abs> [--model p/m] [--bg] [--skill name] [--no-fallback]'
     : 'usage: offload agy "<model label>" "<prompt>" --dir <abs> [--bg] [--skill name]');
   const job = {
     id: newId(), lane, dir, status: 'running', created: now(),
     agent: lane === 'oc' ? target : undefined,
     model: lane === 'agy' ? target : opt.model,
     modelStr: lane === 'oc' ? opt.model : undefined,
-    sessionId: opt.session, timeout: opt.timeout,
+    timeout: opt.timeout,
     noFallback: !!opt['no-fallback'],
     task: task.slice(0, 200),
     fullPrompt: buildPrompt(task, dir),
@@ -690,7 +702,7 @@ if (!table[cmd]) {
   console.log(`offload — run subagent work on free/external models (save Claude tokens)
 
   offload role <name> "<prompt>" --dir <abs> [--bg] [--skill name] [--vs claude|gemini] [--timeout s]
-  offload oc <agent> "<prompt>" --dir <abs> [--model p/m] [--bg] [--skill name] [--timeout s] [--session id] [--no-context] [--json] [--full]
+  offload oc <agent> "<prompt>" --dir <abs> [--model p/m] [--bg] [--skill name] [--timeout s] [--no-context] [--json] [--full]
   offload agy "<model label>" "<prompt>" --dir <abs> [--bg] [--skill name] [--timeout s]
   offload status [jobId] | abort <jobId> | health | agents | models | skills | chains | roles
 
