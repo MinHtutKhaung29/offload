@@ -35,7 +35,10 @@ const CHAINS = {
   explore: ['opencode/deepseek-v4-flash-free', 'opencode/mimo-v2.5-free', 'groq/llama-3.1-8b-instant'],
   // north-mini-code-free REMOVED 2026-07-08: canary-confirmed dead (2/2 probes,
   // zero output parts on trivial PONG, empty completion) — do not re-add without retest.
-  review:  ['opencode/deepseek-v4-flash-free', 'cerebras/zai-glm-4.7'],
+  // cerebras/zai-glm-4.7 removed from review chain 2026-07-11: gets stuck
+  // "blocked, cannot read file" and loops status templates until it burns
+  // its turn budget, never producing a real review (job_mrf1uop730p0).
+  review:  ['opencode/deepseek-v4-flash-free', 'opencode/mimo-v2.5-free'],
   plan:    ['google/gemini-3.1-pro-preview', 'opencode/mimo-v2.5-free'],
   heavy:   ['nvidia/deepseek-ai/deepseek-v4-pro', 'google/gemini-3.1-pro-preview'],
 };
@@ -95,12 +98,12 @@ const ROLES = {
   // no-ops: returned a task restatement, edited nothing — undetectable by
   // failover since output is non-empty). Do not give glm implementation roles.
   frontend:          { lane: 'oc', agent: 'ecc-frontend-builder',
-    pre: 'FRONTEND BUILDER. Implement UI/HTML/CSS/JS changes. Match existing style, design tokens.' },
+    pre: 'FRONTEND BUILDER. Implement UI/HTML/CSS/JS changes. Match existing style, design tokens. Check your skill library for a skill matching this task, and invoke/apply it if one fits. In your final report, state which skill (if any) you used.' },
   backend:           { lane: 'oc', agent: 'backend-developer',
-    pre: 'BACKEND BUILDER. Implement server/API/data logic changes. Include error handling.' },
+    pre: 'BACKEND BUILDER. Implement server/API/data logic changes. Include error handling. Check your skill library for a skill matching this task, and invoke/apply it if one fits. In your final report, state which skill (if any) you used.' },
   'builder-careful': { lane: 'agy', model: 'Claude Sonnet 4.6 (Thinking)', pool: 'claude', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (High)', pool: 'gemini' },
-    pre: 'CAREFUL BUILDER. Risky multi-file changes. Think before edit. Minimal, consistent changes. Re-check each edit.' },
-  reviewer:          { lane: 'oc', agent: 'code-reviewer', noEdit: true,
+    pre: 'CAREFUL BUILDER. Risky multi-file changes. Check your skill library for a skill matching this task, and invoke/apply it if one fits. Before each edit: grep the exact search string first and confirm it is unique in the file; edit in small chunks; after each edit, re-read the changed region and confirm only the intended lines changed (check the line-count delta matches intent). Minimal, consistent changes. In your final report, state which skill (if any) you used.' },
+  reviewer:          { lane: 'oc', agent: 'code-reviewer', noEdit: true, roleModel: 'opencode/deepseek-v4-flash-free',
     pre: 'CODE REVIEWER. Review code/diff: bugs, quality, maintainability. Report findings ranked by severity.' },
   'reviewer-hard':   { lane: 'agy', crossFamily: true, defaultModel: 'Claude Opus 4.6 (Thinking)', pool: 'claude', noEdit: true, fb: { lane: 'oc', agent: 'oracle' },
     pre: 'ADVERSARIAL REVIEWER. High-stakes work. Actively find what\'s wrong or risky. Challenge assumptions.' },
@@ -111,11 +114,11 @@ const ROLES = {
   tester:            { lane: 'oc', agent: 'e2e-runner',
     pre: 'TESTER. Write and/or run tests for described behavior. Report pass/fail with evidence.' },
   'build-fixer':     { lane: 'oc', agent: 'build-error-resolver',
-    pre: 'BUILD FIXER. Diagnose build/test failure. Apply MINIMAL fix. No refactor.' },
+    pre: 'BUILD FIXER. Diagnose build/test failure. Apply MINIMAL fix. No refactor. Check your skill library for a skill matching this task, and invoke/apply it if one fits. In your final report, state which skill (if any) you used.' },
   cleaner:           { lane: 'oc', agent: 'refactor-cleaner', roleModel: 'opencode/nemotron-3-ultra-free',
-    pre: 'CLEANER. Remove dead code, tidy structure. No behavior change.' },
+    pre: 'CLEANER. Remove dead code, tidy structure. No behavior change. Check your skill library for a skill matching this task, and invoke/apply it if one fits. In your final report, state which skill (if any) you used.' },
   'doc-writer':      { lane: 'oc', agent: 'doc-updater',
-    pre: 'DOC WRITER. Write/update docs to match reality. Concise, accurate.' },
+    pre: 'DOC WRITER. Write/update docs to match reality. Concise, accurate. Check your skill library for a skill matching this task, and invoke/apply it if one fits. In your final report, state which skill (if any) you used.' },
 };
 // cross-family pick: the reviewer must be a different model family than the
 // work's author. --vs <family-of-author> selects the opposite side.
@@ -167,7 +170,8 @@ function loadJob(id) {
   return JSON.parse(fs.readFileSync(jobFile(id), 'utf8'));
 }
 function allJobs() {
-  return fs.readdirSync(JOBS).filter(f => f.endsWith('.json'))
+  // skip non-job files like _quota.json (no status field — crashed status list)
+  return fs.readdirSync(JOBS).filter(f => f.endsWith('.json') && !f.startsWith('_'))
     .map(f => JSON.parse(fs.readFileSync(path.join(JOBS, f), 'utf8')))
     .sort((a, b) => (a.created < b.created ? 1 : -1));
 }
@@ -314,6 +318,19 @@ async function liveState(job) {
   return bits.join('\n');
 }
 
+// abort a session AND its child sessions (models spawning sub-sessions via
+// background_task kept burning tokens after the parent was aborted — 2026-07-11)
+async function abortSessionTree(sessionId, dir) {
+  const q = { directory: dir };
+  try {
+    const all = await api('GET', '/session', null, q);
+    for (const s of (all || []).filter(s => s.parentID === sessionId)) {
+      try { await api('POST', `/session/${s.id}/abort`, {}, q); } catch { /* best effort */ }
+    }
+  } catch { /* best effort */ }
+  try { await api('POST', `/session/${sessionId}/abort`, {}, q); } catch { /* best effort */ }
+}
+
 function textParts(msgs) {
   let t = '';
   for (const m of msgs) {
@@ -369,6 +386,8 @@ async function runOcAttempt(job, modelStr) {
   let lastSig = '', lastChange = Date.now();
   for (;;) {
     await new Promise(r => setTimeout(r, 5000));
+    // user ran `offload abort` — stop here, don't fail over to a new session
+    if (loadJob(job.id).status === 'aborted') { const e = new Error('aborted by user'); e.kind = 'aborted'; throw e; }
     const msgs = await api('GET', `/session/${ses.id}/message`, null, q);
     const asst = msgs.filter(m => m.info?.role === 'assistant');
     const last = asst[asst.length - 1];
@@ -429,11 +448,14 @@ async function runOc(job) {
       saveJob(job);
       return text;
     } catch (e) {
-      const kind = e.kind || (/429|rate.?limit|quota/i.test(e.message) ? 'ratelimit' : 'error');
+      let kind = e.kind || (/429|rate.?limit|quota/i.test(e.message) ? 'ratelimit' : 'error');
+      // re-check disk: an abort can also surface as a dead-session API error
+      try { if (loadJob(job.id).status === 'aborted') kind = 'aborted'; } catch { /* keep kind */ }
       job.attempts.push({ model: label, outcome: kind });
+      if (kind === 'aborted') { job.status = 'aborted'; saveJob(job); throw e; }
       saveJob(job);
       lastErr = e;
-      if (job.sessionId) { try { await api('POST', `/session/${job.sessionId}/abort`, {}, { directory: job.dir }); } catch { /* best effort */ } }
+      if (job.sessionId) await abortSessionTree(job.sessionId, job.dir);
       const next = models[models.indexOf(m) + 1];
       if (next !== undefined) console.error(`offload: [${job.id}] ${label} failed (${kind}) — failing over to ${next}`);
     }
@@ -635,15 +657,18 @@ async function cmdStatus() {
     return out(summarize(j, text), { ...j, excerpt: text.split('\n').slice(0, 20).join('\n') });
   }
   const rows = allJobs().slice(0, 15).map(j =>
-    `${j.id}  ${j.status.padEnd(7)} ${j.lane}  ${(j.agent || j.model || '').padEnd(28)} ${j.created}  ${j.task}`);
+    `${j.id}  ${(j.status || '?').padEnd(7)} ${j.lane || '?'}  ${(j.agent || j.model || '').padEnd(28)} ${j.created}  ${(j.task || '').split('\n')[0]}`);
   out(rows.join('\n') || '(no jobs)', allJobs().slice(0, 15));
 }
 
 async function cmdAbort() {
   if (!pos[0]) die('usage: offload abort <jobId>');
   const j = loadJob(pos[0]);
-  if (j.lane === 'oc' && j.sessionId) await api('POST', `/session/${j.sessionId}/abort`, {}, { directory: j.dir });
+  // save status BEFORE killing the session — the worker polls the job file
+  // and must see 'aborted' rather than a dead-session API error (else it
+  // would classify the failure as 'error' and fail over to a new model)
   j.status = 'aborted'; saveJob(j);
+  if (j.lane === 'oc' && j.sessionId) await abortSessionTree(j.sessionId, j.dir);
   out(`[${j.id}] aborted`, j);
 }
 
