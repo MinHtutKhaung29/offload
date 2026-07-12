@@ -46,6 +46,7 @@ const OPENROUTER_DAILY_STOP = 45; // pool is 50/day shared with agents we don't 
 // `noEdit` appends PROPOSE ONLY. `crossFamily` picks the opposite family via --vs.
 // agy has no agent files, so this prompt IS the whole researcher agent —
 // keep in sync with oc's agents/researcher.md.
+const RESEARCHER_SPEC_OC = 'RESEARCHER. Task: one sentence first, then details. Rules: cite every claim inline (source, date, URL); confidence HIGH/MODERATE/LOW; report contradictions, never false consensus; copy numbers verbatim; synthesize by theme not source; write ONE findings markdown file at given path, stop. No edits to existing files. PDFs: extract via python pypdf to <name>_extracted.txt, read that; empty extraction = scanned, report "needs vision lane", move on.';
 const RESEARCHER_SPEC_AGY = [
   'RESEARCHER. Process over conclusions: every claim traced, confidence calibrated, contradictions reported.',
   'Before start: check skills library, invoke relevant skill. Don\'t wait for skill name.',
@@ -58,16 +59,16 @@ const RESEARCHER_SPEC_AGY = [
 ].join('\n');
 
 const ROLES = {
-  planner:           { lane: 'agy', model: 'Gemini 3.1 Pro (High)', pool: 'gemini', fb: { lane: 'oc', agent: 'planner' },
+  planner:           { lane: 'agy', model: 'Gemini 3.1 Pro (High)', fb: { lane: 'oc', agent: 'planner' },
     pre: 'PLANNER. Concrete step-by-step implementation plan: files, order, risks, verification. No implementation.' },
-  'plan-critic':     { lane: 'agy', crossFamily: true, defaultModel: 'GPT-OSS 120B (Medium)', pool: 'claude', noEdit: true, fb: { lane: 'oc', agent: 'oracle' },
+  'plan-critic':     { lane: 'agy', crossFamily: true, defaultModel: 'GPT-OSS 120B (Medium)', noEdit: true, fb: { lane: 'oc', agent: 'oracle' },
     pre: 'PLAN CRITIC. Adversarial review: find flaws, risks, missing steps, better alternatives.' },
   // researcher/2/3 = fan-out across 3 model families for load spread
-  researcher:        { lane: 'oc', agent: 'researcher', roleModel: 'opencode/nemotron-3-ultra-free', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (Low)', pool: 'gemini' },
-    pre: 'RESEARCHER. Task: one sentence first, then details. Rules: cite every claim inline (source, date, URL); confidence HIGH/MODERATE/LOW; report contradictions, never false consensus; copy numbers verbatim; synthesize by theme not source; write ONE findings markdown file at given path, stop. No edits to existing files. PDFs: extract via python pypdf to <name>_extracted.txt, read that; empty extraction = scanned, report "needs vision lane", move on.' },
-  researcher2:       { lane: 'oc', agent: 'researcher', roleModel: 'opencode/deepseek-v4-flash-free', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (Low)', pool: 'gemini' },
-    pre: 'RESEARCHER. Task: one sentence first, then details. Rules: cite every claim inline (source, date, URL); confidence HIGH/MODERATE/LOW; report contradictions, never false consensus; copy numbers verbatim; synthesize by theme not source; write ONE findings markdown file at given path, stop. No edits to existing files. PDFs: extract via python pypdf to <name>_extracted.txt, read that; empty extraction = scanned, report "needs vision lane", move on.' },
-  researcher3:       { lane: 'agy', model: 'Gemini 3.5 Flash (Medium)', pool: 'gemini', fb: { lane: 'oc', agent: 'researcher' },
+  researcher:        { lane: 'oc', agent: 'researcher', roleModel: 'opencode/nemotron-3-ultra-free', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (Low)' },
+    pre: RESEARCHER_SPEC_OC },
+  researcher2:       { lane: 'oc', agent: 'researcher', roleModel: 'opencode/deepseek-v4-flash-free', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (Low)' },
+    pre: RESEARCHER_SPEC_OC },
+  researcher3:       { lane: 'agy', model: 'Gemini 3.5 Flash (Medium)', fb: { lane: 'oc', agent: 'researcher' },
     pre: RESEARCHER_SPEC_AGY },
   explorer:          { lane: 'oc', agent: 'explore',
     pre: 'EXPLORER. Locate and explain code/files relevant to question. Read-only. Report paths + findings.' },
@@ -76,13 +77,13 @@ const ROLES = {
     pre: 'FRONTEND BUILDER. Implement UI/HTML/CSS/JS changes. Match existing style, design tokens.' },
   backend:           { lane: 'oc', agent: 'backend-developer',
     pre: 'BACKEND BUILDER. Implement server/API/data logic changes. Include error handling.' },
-  'builder-careful': { lane: 'agy', model: 'Claude Sonnet 4.6 (Thinking)', pool: 'claude', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (High)', pool: 'gemini' },
+  'builder-careful': { lane: 'agy', model: 'Claude Sonnet 4.6 (Thinking)', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (High)' },
     pre: 'CAREFUL BUILDER. Risky multi-file changes. Think before edit. Minimal, consistent changes. Re-check each edit.' },
   reviewer:          { lane: 'oc', agent: 'code-reviewer', noEdit: true,
     pre: 'CODE REVIEWER. Review code/diff: bugs, quality, maintainability. Report findings ranked by severity.' },
-  'reviewer-hard':   { lane: 'agy', crossFamily: true, defaultModel: 'Claude Opus 4.6 (Thinking)', pool: 'claude', noEdit: true, fb: { lane: 'oc', agent: 'oracle' },
+  'reviewer-hard':   { lane: 'agy', crossFamily: true, defaultModel: 'Claude Opus 4.6 (Thinking)', noEdit: true, fb: { lane: 'oc', agent: 'oracle' },
     pre: 'ADVERSARIAL REVIEWER. High-stakes work. Actively find what\'s wrong or risky. Challenge assumptions.' },
-  security:          { lane: 'oc', agent: 'security-reviewer', noEdit: true, fb: { lane: 'agy', model: 'Claude Opus 4.6 (Thinking)', pool: 'claude' },
+  security:          { lane: 'oc', agent: 'security-reviewer', noEdit: true, fb: { lane: 'agy', model: 'Claude Opus 4.6 (Thinking)' },
     pre: 'SECURITY REVIEWER. Audit vulnerabilities: injection, auth, secrets, OWASP Top 10. Report findings with severity.' },
   'ui-critic':       { lane: 'oc', agent: 'ecc-ui-reviewer', noEdit: true,
     pre: 'UI CRITIC. Evaluate visual design, layout, UX quality. Report concrete issues + improvements.' },
@@ -98,8 +99,8 @@ const ROLES = {
 // cross-family pick: the reviewer must be a different model family than the
 // work's author. --vs <family-of-author> selects the opposite side.
 const CROSS_FAMILY = {
-  claude: { model: 'Gemini 3.1 Pro (High)', pool: 'gemini' },
-  gemini: { model: 'Claude Opus 4.6 (Thinking)', pool: 'claude' },
+  claude: { model: 'Gemini 3.1 Pro (High)' },
+  gemini: { model: 'Claude Opus 4.6 (Thinking)' },
 };
 
 fs.mkdirSync(JOBS, { recursive: true });
