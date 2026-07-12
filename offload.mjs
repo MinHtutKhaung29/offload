@@ -212,6 +212,7 @@ function buildPrompt(task, dir, role) {
     if (!p) die(`skill not found in Claude library: ${s}`);
     lines.push(`Invoke ${s} skill. Also read: ${p}. Apply it.`);
   }
+  lines.push('Check your skill library and use matching skills for this task.');
   lines.push('');
   lines.push('TASK:');
   lines.push(task);
