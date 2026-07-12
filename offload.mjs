@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 // offload — move heavy subagent work OFF Claude's quota.
 // Two lanes: `oc` (opencode serve HTTP API) and `agy` (Antigravity CLI).
-// Design rationale: see plan 2026-07-05 (async-native, dir required,
-// fresh session per call, router-context + skill injection by default).
+// History/rationale: vault 02_Projects/offload.md
 
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -22,19 +21,12 @@ const DEFAULTS = {
   vault: process.env.OFFLOAD_VAULT || null,
 };
 
-// Failover chains per capability tier (grounded in CLAUDE_OPENCODE_RULES.md
-// pool analysis: Zen/Cerebras generous; Groq only the 14.4k-RPD 8B model;
-// OpenRouter free = 50/day SHARED, last resort + counted; NIM fenced to heavy).
-// chain[0] documents the tier's configured primary; attempt 1 always runs the
-// agent's own default, so failover starts at chain[1].
+// Failover chains per tier. chain[0] = documented primary; attempt 1 runs the
+// agent's own default, so failover starts at chain[1]. Model bans/removals
+// and pool limits: CLAUDE_OPENCODE_RULES.md.
 const CHAINS = {
-  // zai-glm removed from build (implementation) chain 2026-07-06: silent no-op
-  // canary fail (writes nothing, returns plausible text). Kept in review chain
-  // — review output IS text, so the failure mode doesn't apply there.
   build:   ['opencode/deepseek-v4-flash-free', 'opencode/mimo-v2.5-free', 'opencode/nemotron-3-ultra-free', 'groq/llama-3.1-8b-instant', 'openrouter/nvidia/nemotron-3-super-120b-a12b:free'],
   explore: ['opencode/deepseek-v4-flash-free', 'opencode/mimo-v2.5-free', 'groq/llama-3.1-8b-instant'],
-  // north-mini-code-free REMOVED 2026-07-08: canary-confirmed dead (2/2 probes,
-  // zero output parts on trivial PONG, empty completion) — do not re-add without retest.
   review:  ['opencode/deepseek-v4-flash-free', 'cerebras/zai-glm-4.7'],
   plan:    ['google/gemini-3.1-pro-preview', 'opencode/mimo-v2.5-free'],
   heavy:   ['nvidia/deepseek-ai/deepseek-v4-pro', 'google/gemini-3.1-pro-preview'],
@@ -49,20 +41,12 @@ const AGENT_TIER = {
 const MAX_ATTEMPTS = 3;
 const OPENROUTER_DAILY_STOP = 45; // pool is 50/day shared with agents we don't see
 
-// Specialized roles (v1.2) — one primary model per role, load spread across
-// pools, every fallback in a DIFFERENT pool. agy is 2 quota pools, not 6
-// models: 'gemini' (3.1 Pro + 3.5 Flash) and 'claude' (Opus + Sonnet +
-// GPT-OSS) — fallbacks must cross pools. oc roles ride the tier chains;
-// `roleModel` heads the chain (does not disable it, unlike user --model).
-// `noEdit` appends PROPOSE ONLY (agy agents edit files unasked — RULES.md #5).
-// `crossFamily` roles pick the opposite family of the work's author (--vs).
-// Full self-contained researcher spec for the AGY lane. agy has no agent-file
-// mechanism (unlike oc's agents/researcher.md), so the one-shot prompt IS the
-// whole agent — this embeds the SAME specialization the oc agent file carries
-// (methodology, provenance, output contract), one-shot-CLI-optimized per the
-// 2026-07-08 agent-design research: absolute paths, explicit output contract,
-// hard stop condition. Tool guidance differs from oc: agy Gemini reads PDFs
-// NATIVELY (no pypdf step). Keep this in sync with agents/researcher.md.
+// Roles: agy fallbacks must cross quota pools ('gemini' vs 'claude' — 2 pools,
+// not 6 models). `roleModel` heads the tier chain without disabling it.
+// `noEdit` appends PROPOSE ONLY. `crossFamily` picks the opposite family via --vs.
+// agy has no agent files, so this prompt IS the whole researcher agent —
+// keep in sync with oc's agents/researcher.md.
+const RESEARCHER_SPEC_OC = 'RESEARCHER. Task: one sentence first, then details. Rules: cite every claim inline (source, date, URL); confidence HIGH/MODERATE/LOW; report contradictions, never false consensus; copy numbers verbatim; synthesize by theme not source; write ONE findings markdown file at given path, stop. No edits to existing files. PDFs: extract via python pypdf to <name>_extracted.txt, read that; empty extraction = scanned, report "needs vision lane", move on.';
 const RESEARCHER_SPEC_AGY = [
   'RESEARCHER. Process over conclusions: every claim traced, confidence calibrated, contradictions reported.',
   'Before start: check skills library, invoke relevant skill. Don\'t wait for skill name.',
@@ -75,36 +59,31 @@ const RESEARCHER_SPEC_AGY = [
 ].join('\n');
 
 const ROLES = {
-  planner:           { lane: 'agy', model: 'Gemini 3.1 Pro (High)', pool: 'gemini', fb: { lane: 'oc', agent: 'planner' },
+  planner:           { lane: 'agy', model: 'Gemini 3.1 Pro (High)', fb: { lane: 'oc', agent: 'planner' },
     pre: 'PLANNER. Concrete step-by-step implementation plan: files, order, risks, verification. No implementation.' },
-  'plan-critic':     { lane: 'agy', crossFamily: true, defaultModel: 'GPT-OSS 120B (Medium)', pool: 'claude', noEdit: true, fb: { lane: 'oc', agent: 'oracle' },
+  'plan-critic':     { lane: 'agy', crossFamily: true, defaultModel: 'GPT-OSS 120B (Medium)', noEdit: true, fb: { lane: 'oc', agent: 'oracle' },
     pre: 'PLAN CRITIC. Adversarial review: find flaws, risks, missing steps, better alternatives.' },
-  // researcher rebuilt 2026-07-08: dedicated agents/researcher.md (Nemotron 3 Ultra
-  // primary — canary-passed PDF extraction 2/2; least-loaded Zen model). Fan-out
-  // pattern: researcher + researcher2 (DeepSeek Flash) + researcher3 (agy Gemini,
-  // native PDF) = 3 model families, load spread across pools.
-  researcher:        { lane: 'oc', agent: 'researcher', roleModel: 'opencode/nemotron-3-ultra-free', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (Low)', pool: 'gemini' },
-    pre: 'RESEARCHER. Task: one sentence first, then details. Rules: cite every claim inline (source, date, URL); confidence HIGH/MODERATE/LOW; report contradictions, never false consensus; copy numbers verbatim; synthesize by theme not source; write ONE findings markdown file at given path, stop. No edits to existing files. PDFs: extract via python pypdf to <name>_extracted.txt, read that; empty extraction = scanned, report "needs vision lane", move on.' },
-  researcher2:       { lane: 'oc', agent: 'researcher', roleModel: 'opencode/deepseek-v4-flash-free', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (Low)', pool: 'gemini' },
-    pre: 'RESEARCHER. Task: one sentence first, then details. Rules: cite every claim inline (source, date, URL); confidence HIGH/MODERATE/LOW; report contradictions, never false consensus; copy numbers verbatim; synthesize by theme not source; write ONE findings markdown file at given path, stop. No edits to existing files. PDFs: extract via python pypdf to <name>_extracted.txt, read that; empty extraction = scanned, report "needs vision lane", move on.' },
-  researcher3:       { lane: 'agy', model: 'Gemini 3.5 Flash (Medium)', pool: 'gemini', fb: { lane: 'oc', agent: 'researcher' },
+  // researcher/2/3 = fan-out across 3 model families for load spread
+  researcher:        { lane: 'oc', agent: 'researcher', roleModel: 'opencode/nemotron-3-ultra-free', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (Low)' },
+    pre: RESEARCHER_SPEC_OC },
+  researcher2:       { lane: 'oc', agent: 'researcher', roleModel: 'opencode/deepseek-v4-flash-free', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (Low)' },
+    pre: RESEARCHER_SPEC_OC },
+  researcher3:       { lane: 'agy', model: 'Gemini 3.5 Flash (Medium)', fb: { lane: 'oc', agent: 'researcher' },
     pre: RESEARCHER_SPEC_AGY },
   explorer:          { lane: 'oc', agent: 'explore',
     pre: 'EXPLORER. Locate and explain code/files relevant to question. Read-only. Report paths + findings.' },
-  // NOTE: zai-glm-4.7 canary-FAILED as frontend primary 2026-07-06 (2/2 silent
-  // no-ops: returned a task restatement, edited nothing — undetectable by
-  // failover since output is non-empty). Do not give glm implementation roles.
+  // ponytail: zai-glm banned from implementation roles (silent no-op) — RULES.md
   frontend:          { lane: 'oc', agent: 'ecc-frontend-builder',
     pre: 'FRONTEND BUILDER. Implement UI/HTML/CSS/JS changes. Match existing style, design tokens.' },
   backend:           { lane: 'oc', agent: 'backend-developer',
     pre: 'BACKEND BUILDER. Implement server/API/data logic changes. Include error handling.' },
-  'builder-careful': { lane: 'agy', model: 'Claude Sonnet 4.6 (Thinking)', pool: 'claude', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (High)', pool: 'gemini' },
+  'builder-careful': { lane: 'agy', model: 'Claude Sonnet 4.6 (Thinking)', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (High)' },
     pre: 'CAREFUL BUILDER. Risky multi-file changes. Think before edit. Minimal, consistent changes. Re-check each edit.' },
   reviewer:          { lane: 'oc', agent: 'code-reviewer', noEdit: true,
     pre: 'CODE REVIEWER. Review code/diff: bugs, quality, maintainability. Report findings ranked by severity.' },
-  'reviewer-hard':   { lane: 'agy', crossFamily: true, defaultModel: 'Claude Opus 4.6 (Thinking)', pool: 'claude', noEdit: true, fb: { lane: 'oc', agent: 'oracle' },
+  'reviewer-hard':   { lane: 'agy', crossFamily: true, defaultModel: 'Claude Opus 4.6 (Thinking)', noEdit: true, fb: { lane: 'oc', agent: 'oracle' },
     pre: 'ADVERSARIAL REVIEWER. High-stakes work. Actively find what\'s wrong or risky. Challenge assumptions.' },
-  security:          { lane: 'oc', agent: 'security-reviewer', noEdit: true, fb: { lane: 'agy', model: 'Claude Opus 4.6 (Thinking)', pool: 'claude' },
+  security:          { lane: 'oc', agent: 'security-reviewer', noEdit: true, fb: { lane: 'agy', model: 'Claude Opus 4.6 (Thinking)' },
     pre: 'SECURITY REVIEWER. Audit vulnerabilities: injection, auth, secrets, OWASP Top 10. Report findings with severity.' },
   'ui-critic':       { lane: 'oc', agent: 'ecc-ui-reviewer', noEdit: true,
     pre: 'UI CRITIC. Evaluate visual design, layout, UX quality. Report concrete issues + improvements.' },
@@ -120,8 +99,8 @@ const ROLES = {
 // cross-family pick: the reviewer must be a different model family than the
 // work's author. --vs <family-of-author> selects the opposite side.
 const CROSS_FAMILY = {
-  claude: { model: 'Gemini 3.1 Pro (High)', pool: 'gemini' },
-  gemini: { model: 'Claude Opus 4.6 (Thinking)', pool: 'claude' },
+  claude: { model: 'Gemini 3.1 Pro (High)' },
+  gemini: { model: 'Claude Opus 4.6 (Thinking)' },
 };
 
 fs.mkdirSync(JOBS, { recursive: true });
@@ -212,6 +191,7 @@ function buildPrompt(task, dir, role) {
     if (!p) die(`skill not found in Claude library: ${s}`);
     lines.push(`Invoke ${s} skill. Also read: ${p}. Apply it.`);
   }
+  lines.push('Check your skill library and use matching skills for this task.');
   lines.push('');
   lines.push('TASK:');
   lines.push(task);
@@ -234,9 +214,8 @@ function summarize(job, text) {
 }
 
 // ---------- verification (evidence, not self-report) ----------
-// Snapshot `git status --porcelain` at job creation; diff it after completion.
-// Catches: no-edit agents that edited anyway (mimo 2026-07-08), and "silent
-// no-op" builders that report success but changed nothing (zai-glm class).
+// git-status diff before/after: catches no-edit agents that edited anyway,
+// and builders that report success but changed nothing.
 function gitSnapshot(dir) {
   const r = spawnSync('git', ['status', '--porcelain'], { cwd: dir, encoding: 'utf8', timeout: 15000 });
   return r.status === 0 ? (r.stdout || '') : null; // null = not a git repo
@@ -288,9 +267,7 @@ function parseModel(s) {
   return { providerID: s.slice(0, i), modelID: s.slice(i + 1) };
 }
 
-// live diagnosis for a session: what tool is it stuck in, and is a
-// permission ask pending? (the 2026-07-08 external_directory hang looked
-// like 9 model failures until this info was pulled out by hand)
+// live diagnosis: which tool is the session stuck in, any pending permission ask?
 async function liveState(job) {
   const bits = [];
   try {
@@ -377,11 +354,8 @@ async function runOcAttempt(job, modelStr) {
     if (last?.info?.time?.completed) {
       const text = textParts(msgs);
       if (!text.trim()) {
-        // Some models (e.g. Nemotron 3 Ultra) end a turn on a terminal tool
-        // call — they do the work and write the output file but emit no closing
-        // text part. Treat that as success IF a file actually appeared, so the
-        // real deliverable isn't discarded as "empty". Only trusts a positive
-        // git signal; a non-repo dir still counts as empty (can't confirm).
+        // some models end on a tool call with no closing text — count it as
+        // success only if git confirms a file was actually written
         const wrote = changedFiles(job);
         if (wrote.length) return `(no chat summary emitted; wrote ${wrote.length} file(s): ${wrote.slice(0, 3).map(l => l.replace(/^\s*\S+\s+/, '')).join(' | ')})`;
         const e = new Error('empty response'); e.kind = 'empty'; throw e;
