@@ -45,14 +45,20 @@ param (silent wrong-project runs). All fixed here as hard guardrails.
 
 ## Install
 
-Node ≥ 18. Copy `offload.mjs` anywhere. Optional `config.json` beside it:
+Node ≥ 18, zero npm deps. `offload.mjs` self-anchors — `jobs/`, `agy-roles/`,
+`config.json` live beside it, so a clone works wherever it lands
+(`OFFLOAD_HOME` to override).
 
-```json
-{ "vault": "C:/path/to/your/notes-vault" }
-```
+**Fastest path — let an AI coding agent set it up:** clone the repo, then point
+your agent (Claude Code etc.) at [`SETUP.md`](SETUP.md) — an ordered, executable
+runbook that installs the two CLIs, copies the bundled `agents/` into opencode's
+config, wires models to what your account can reach, and health-checks. It asks
+you only for the provider logins it can't obtain.
 
-- `oc` lane: `opencode serve --port 4096` must be running.
-- `agy` lane: `agy` CLI logged in + on PATH (`OFFLOAD_AGY` to override).
+Manual prereqs (what `SETUP.md` automates):
+- `oc` lane: `opencode serve --port 4096` running; bundled `agents/*.md` copied to `~/.config/opencode/agents/` (`OFFLOAD_SERVER` to override host/port).
+- `agy` lane (optional): `agy` CLI logged in + on PATH (`OFFLOAD_AGY` to override).
+- Optional `config.json` beside the script: `{ "vault": "C:/path/to/your/notes-vault" }`.
 
 ## Usage
 

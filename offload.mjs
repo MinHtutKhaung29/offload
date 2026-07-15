@@ -11,7 +11,10 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const HOME = os.homedir();
-const BASE = path.join(HOME, '.config', 'offload');
+const SELF = fileURLToPath(import.meta.url);
+// BASE = where jobs/, agy-roles/, config.json live. Anchored to the script's
+// own dir so a clone works wherever it lands (override w/ OFFLOAD_HOME).
+const BASE = process.env.OFFLOAD_HOME || path.dirname(SELF);
 const JOBS = path.join(BASE, 'jobs');
 // agy lane: file-based role charters. --agent subagents crash in agy print
 // mode (no tool converter for Read), but AGENTS.md rules load headless — so
@@ -19,7 +22,6 @@ const JOBS = path.join(BASE, 'jobs');
 const AGYROLES = path.join(BASE, 'agy-roles');
 const SERVER_PID_FILE = path.join(BASE, 'server.pid');
 const IDLE_SHUTDOWN_MS = 5 * 60 * 1000;
-const SELF = fileURLToPath(import.meta.url);
 const SERVER = process.env.OFFLOAD_SERVER || 'http://localhost:4096';
 const AGY = process.env.OFFLOAD_AGY || 'agy';
 // vault: root of your notes vault; project routers are looked up at

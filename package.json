@@ -1,0 +1,10 @@
+{
+  "name": "offload",
+  "version": "1.0.0",
+  "description": "Run coding-agent subtasks on free/cheap external models (opencode + Antigravity) instead of burning paid-agent quota.",
+  "type": "module",
+  "bin": { "offload": "offload.mjs" },
+  "files": ["offload.mjs", "agents/", "agy-roles/", "SETUP.md", "README.md"],
+  "engines": { "node": ">=18" },
+  "license": "MIT"
+}
