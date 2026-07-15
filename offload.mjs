@@ -13,6 +13,8 @@ import { fileURLToPath } from 'node:url';
 const HOME = os.homedir();
 const BASE = path.join(HOME, '.config', 'offload');
 const JOBS = path.join(BASE, 'jobs');
+const SERVER_PID_FILE = path.join(BASE, 'server.pid');
+const IDLE_SHUTDOWN_MS = 5 * 60 * 1000;
 const SELF = fileURLToPath(import.meta.url);
 const SERVER = process.env.OFFLOAD_SERVER || 'http://localhost:4096';
 const AGY = process.env.OFFLOAD_AGY || 'agy';
@@ -77,49 +79,41 @@ const RESEARCHER_SPEC_AGY = [
   'DONE WHEN: findings file exists, all sections populated, every claim cited. Final message: 3-5 line summary + file path. Nothing else.',
 ].join('\n');
 
+// 6-role compact team (2026-07-15). Modes = flags that merge a partial override
+// onto the base role (--vs critic, --careful, --hard, --ui, --agy). Cut roles
+// (backend/tester/build-fixer/cleaner/doc-writer/reviewer-hard: 0 usage over 286
+// jobs) stay reachable via raw `offload oc <agent>`. NOTE: glm-5.1 on
+// security-reviewer is UNTESTED — old zai-glm-4.7 canary-FAILED (silent no-op).
+const RESEARCH_PRE = 'RESEARCHER. Task: one sentence first, then details. Rules: cite every claim inline (source, date, URL); confidence HIGH/MODERATE/LOW; report contradictions, never false consensus; copy numbers verbatim; synthesize by theme not source; write ONE findings markdown file at given path, stop. No edits to existing files. PDFs: extract via python pypdf to <name>_extracted.txt, read that; empty extraction = scanned, report "needs vision lane", move on.';
 const ROLES = {
-  planner:           { lane: 'agy', model: 'Gemini 3.1 Pro (High)', pool: 'gemini', fb: { lane: 'oc', agent: 'planner' },
-    pre: 'PLANNER. Concrete step-by-step implementation plan: files, order, risks, verification. No implementation.' },
-  'plan-critic':     { lane: 'agy', crossFamily: true, defaultModel: 'GPT-OSS 120B (Medium)', pool: 'claude', noEdit: true, fb: { lane: 'oc', agent: 'oracle' },
-    pre: 'PLAN CRITIC. Adversarial review: find flaws, risks, missing steps, better alternatives.' },
-  // researcher rebuilt 2026-07-08: dedicated agents/researcher.md (Nemotron 3 Ultra
-  // primary — canary-passed PDF extraction 2/2; least-loaded Zen model). Fan-out
-  // pattern: researcher + researcher2 (DeepSeek Flash) + researcher3 (agy Gemini,
-  // native PDF) = 3 model families, load spread across pools.
-  researcher:        { lane: 'oc', agent: 'researcher', roleModel: 'opencode/nemotron-3-ultra-free', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (Low)', pool: 'gemini' },
-    pre: 'RESEARCHER. Task: one sentence first, then details. Rules: cite every claim inline (source, date, URL); confidence HIGH/MODERATE/LOW; report contradictions, never false consensus; copy numbers verbatim; synthesize by theme not source; write ONE findings markdown file at given path, stop. No edits to existing files. PDFs: extract via python pypdf to <name>_extracted.txt, read that; empty extraction = scanned, report "needs vision lane", move on.' },
-  researcher2:       { lane: 'oc', agent: 'researcher', roleModel: 'opencode/deepseek-v4-flash-free', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (Low)', pool: 'gemini' },
-    pre: 'RESEARCHER. Task: one sentence first, then details. Rules: cite every claim inline (source, date, URL); confidence HIGH/MODERATE/LOW; report contradictions, never false consensus; copy numbers verbatim; synthesize by theme not source; write ONE findings markdown file at given path, stop. No edits to existing files. PDFs: extract via python pypdf to <name>_extracted.txt, read that; empty extraction = scanned, report "needs vision lane", move on.' },
-  researcher3:       { lane: 'agy', model: 'Gemini 3.5 Flash (Medium)', pool: 'gemini', fb: { lane: 'oc', agent: 'researcher' },
-    pre: RESEARCHER_SPEC_AGY },
-  explorer:          { lane: 'oc', agent: 'explore',
+  plan:     { lane: 'agy', model: 'Claude Opus 4.6 (Thinking)', pool: 'claude', fb: { lane: 'oc', agent: 'planner' },
+    pre: 'PLANNER. Concrete step-by-step implementation plan: files, order, risks, verification. No implementation.',
+    modes: { vs: { crossFamily: true, defaultModel: 'GPT-OSS 120B (Medium)', noEdit: true, fb: { lane: 'oc', agent: 'oracle' },
+      pre: 'PLAN CRITIC. Adversarial review: find flaws, risks, missing steps, better alternatives.' } } },
+  research: { lane: 'oc', agent: 'researcher', roleModel: 'opencode/nemotron-3-ultra-free', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (Low)', pool: 'gemini' },
+    pre: RESEARCH_PRE,
+    // --agy: run on the agy lane w/ the native-PDF Gemini spec (fan-out member 3)
+    modes: { agy: { lane: 'agy', model: 'Gemini 3.5 Flash (Medium)', pool: 'gemini', agent: undefined, roleModel: undefined, pre: RESEARCHER_SPEC_AGY } } },
+  explore:  { lane: 'oc', agent: 'explore', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (Low)', pool: 'gemini' },
     pre: 'EXPLORER. Locate and explain code/files relevant to question. Read-only. Report paths + findings.' },
-  // NOTE: zai-glm-4.7 canary-FAILED as frontend primary 2026-07-06 (2/2 silent
-  // no-ops: returned a task restatement, edited nothing — undetectable by
-  // failover since output is non-empty). Do not give glm implementation roles.
-  frontend:          { lane: 'oc', agent: 'ecc-frontend-builder',
-    pre: 'FRONTEND BUILDER. Implement UI/HTML/CSS/JS changes. Match existing style, design tokens. Check your skill library for a skill matching this task, and invoke/apply it if one fits. In your final report, state which skill (if any) you used.' },
-  backend:           { lane: 'oc', agent: 'backend-developer',
-    pre: 'BACKEND BUILDER. Implement server/API/data logic changes. Include error handling. Check your skill library for a skill matching this task, and invoke/apply it if one fits. In your final report, state which skill (if any) you used.' },
-  'builder-careful': { lane: 'agy', model: 'Claude Sonnet 4.6 (Thinking)', pool: 'claude', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (High)', pool: 'gemini' },
-    pre: 'CAREFUL BUILDER. Risky multi-file changes. Check your skill library for a skill matching this task, and invoke/apply it if one fits. Before each edit: grep the exact search string first and confirm it is unique in the file; edit in small chunks; after each edit, re-read the changed region and confirm only the intended lines changed (check the line-count delta matches intent). Minimal, consistent changes. In your final report, state which skill (if any) you used.' },
-  reviewer:          { lane: 'oc', agent: 'code-reviewer', noEdit: true, roleModel: 'opencode/deepseek-v4-flash-free',
-    pre: 'CODE REVIEWER. Review code/diff: bugs, quality, maintainability. Report findings ranked by severity.' },
-  'reviewer-hard':   { lane: 'agy', crossFamily: true, defaultModel: 'Claude Opus 4.6 (Thinking)', pool: 'claude', noEdit: true, fb: { lane: 'oc', agent: 'oracle' },
-    pre: 'ADVERSARIAL REVIEWER. High-stakes work. Actively find what\'s wrong or risky. Challenge assumptions.' },
-  security:          { lane: 'oc', agent: 'security-reviewer', noEdit: true, fb: { lane: 'agy', model: 'Claude Opus 4.6 (Thinking)', pool: 'claude' },
+  build:    { lane: 'oc', agent: 'build', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (High)', pool: 'gemini' },
+    pre: 'BUILDER. Implement the described change. Match existing style, patterns, error handling. Check your skill library for a skill matching this task, and invoke/apply it if one fits. In your final report, state which skill (if any) you used.',
+    // --careful: risky multi-file work -> agy Sonnet w/ grep-before-edit discipline
+    modes: { careful: { lane: 'agy', model: 'Claude Sonnet 4.6 (Thinking)', pool: 'claude', agent: undefined, fb: { lane: 'agy', model: 'Gemini 3.5 Flash (High)', pool: 'gemini' },
+      pre: 'CAREFUL BUILDER. Risky multi-file changes. Check your skill library for a skill matching this task, and invoke/apply it if one fits. Before each edit: grep the exact search string first and confirm it is unique in the file; edit in small chunks; after each edit, re-read the changed region and confirm only the intended lines changed (check the line-count delta matches intent). Minimal, consistent changes. In your final report, state which skill (if any) you used.' } } },
+  review:   { lane: 'oc', agent: 'code-reviewer', noEdit: true, roleModel: 'opencode/deepseek-v4-flash-free', fb: { lane: 'agy', model: 'Claude Sonnet 4.6 (Thinking)', pool: 'claude' },
+    pre: 'CODE REVIEWER. Review code/diff: bugs, quality, maintainability. Report findings ranked by severity.',
+    modes: {
+      // --hard: high-stakes adversarial review, cross-family vs the work's author (--vs)
+      hard: { lane: 'agy', crossFamily: true, defaultModel: 'Claude Opus 4.6 (Thinking)', agent: undefined, roleModel: undefined, noEdit: true, fb: { lane: 'oc', agent: 'oracle' },
+        pre: 'ADVERSARIAL REVIEWER. High-stakes work. Actively find what\'s wrong or risky. Challenge assumptions.' },
+      // --ui: visual/UX review on the dedicated oc agent (its own Gemini default)
+      ui: { lane: 'oc', agent: 'ecc-ui-reviewer', roleModel: undefined, noEdit: true, fb: { lane: 'agy', model: 'Gemini 3.1 Pro (High)', pool: 'gemini' },
+        pre: 'UI CRITIC. Evaluate visual design, layout, UX quality. Report concrete issues + improvements.' } } },
+  security: { lane: 'oc', agent: 'security-reviewer', noEdit: true, fb: { lane: 'agy', model: 'Claude Opus 4.6 (Thinking)', pool: 'claude' },
     pre: 'SECURITY REVIEWER. Audit vulnerabilities: injection, auth, secrets, OWASP Top 10. Report findings with severity.' },
-  'ui-critic':       { lane: 'oc', agent: 'ecc-ui-reviewer', noEdit: true,
-    pre: 'UI CRITIC. Evaluate visual design, layout, UX quality. Report concrete issues + improvements.' },
-  tester:            { lane: 'oc', agent: 'e2e-runner',
-    pre: 'TESTER. Write and/or run tests for described behavior. Report pass/fail with evidence.' },
-  'build-fixer':     { lane: 'oc', agent: 'build-error-resolver',
-    pre: 'BUILD FIXER. Diagnose build/test failure. Apply MINIMAL fix. No refactor. Check your skill library for a skill matching this task, and invoke/apply it if one fits. In your final report, state which skill (if any) you used.' },
-  cleaner:           { lane: 'oc', agent: 'refactor-cleaner', roleModel: 'opencode/nemotron-3-ultra-free',
-    pre: 'CLEANER. Remove dead code, tidy structure. No behavior change. Check your skill library for a skill matching this task, and invoke/apply it if one fits. In your final report, state which skill (if any) you used.' },
-  'doc-writer':      { lane: 'oc', agent: 'doc-updater',
-    pre: 'DOC WRITER. Write/update docs to match reality. Concise, accurate. Check your skill library for a skill matching this task, and invoke/apply it if one fits. In your final report, state which skill (if any) you used.' },
 };
+const MODE_FLAGS = ['agy', 'careful', 'hard', 'ui'];
 // cross-family pick: the reviewer must be a different model family than the
 // work's author. --vs <family-of-author> selects the opposite side.
 const CROSS_FAMILY = {
@@ -136,7 +130,7 @@ const projPath = path.join(BASE, 'projects.json');
 const projects = fs.existsSync(projPath) ? JSON.parse(fs.readFileSync(projPath, 'utf8')) : {};
 
 // ---------- arg parsing ----------
-const BOOL_FLAGS = new Set(['bg', 'json', 'full', 'no-context', 'no-fallback']);
+const BOOL_FLAGS = new Set(['bg', 'json', 'full', 'no-context', 'no-fallback', 'careful', 'hard', 'ui', 'agy']);
 const VALUE_FLAGS = new Set(['model', 'dir', 'timeout', 'router', 'vs']);
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -174,6 +168,20 @@ function allJobs() {
   return fs.readdirSync(JOBS).filter(f => f.endsWith('.json') && !f.startsWith('_'))
     .map(f => JSON.parse(fs.readFileSync(path.join(JOBS, f), 'utf8')))
     .sort((a, b) => (a.created < b.created ? 1 : -1));
+}
+// worst-case wall time: full timeout for every failover attempt, + cleanup grace.
+// A 'running' job past this can only be an abandoned/crashed worker — the poll
+// loop never heartbeats the job file, so wall-clock budget is the liveness signal.
+const withinBudget = (j) => Date.now() - new Date(j.created).getTime() < ((Number(j.timeout) || 600) * MAX_ATTEMPTS + 120) * 1000;
+// reconcile a job whose worker died mid-run (crash/sleep/OS-kill) so it doesn't
+// sit 'running' forever — nothing else transitions a session-less stuck job.
+function reconcileStale(j) {
+  if (j.status === 'running' && !withinBudget(j)) {
+    j.status = 'stale';
+    j.error = j.error || 'worker exited without finishing (reconciled by status)';
+    saveJob(j);
+  }
+  return j;
 }
 
 // ---------- context + skill preamble ----------
@@ -412,7 +420,53 @@ async function runOcAttempt(job, modelStr) {
   }
 }
 
+// only starts/stops the server WE started (tracked via SERVER_PID_FILE);
+// a server the user started manually is left alone entirely.
+// opencode's global npm install is a .cmd shim; spawn() needs shell:true to
+// resolve it, but that makes child.pid the shell wrapper, not the real server
+// process — so the actual pid is looked up by the port it ends up listening on.
+function findServerPid(port) {
+  const r = spawnSync('netstat', ['-ano'], { encoding: 'utf8' });
+  const line = (r.stdout || '').split('\n').find(l => l.includes(`:${port} `) && l.includes('LISTENING'));
+  return line ? Number(line.trim().split(/\s+/).pop()) : null;
+}
+
+async function ensureServer() {
+  try { await api('GET', '/global/health'); return; } catch { /* down, start it */ }
+  const port = new URL(SERVER).port || '4096';
+  const child = spawn('opencode', ['serve', '--port', port], { detached: true, stdio: 'ignore', shell: true });
+  child.unref();
+  for (let i = 0; i < 20; i++) {
+    await new Promise(r => setTimeout(r, 500));
+    try {
+      await api('GET', '/global/health');
+      fs.writeFileSync(SERVER_PID_FILE, String(findServerPid(port) || child.pid));
+      spawnReaper();
+      return;
+    } catch { /* still starting */ }
+  }
+  throw new Error('opencode serve did not become healthy within 10s');
+}
+
+function spawnReaper() {
+  const child = spawn(process.execPath, [SELF, '_reap'], { detached: true, stdio: 'ignore' });
+  child.unref();
+}
+
+async function reap() {
+  for (;;) {
+    await new Promise(r => setTimeout(r, IDLE_SHUTDOWN_MS));
+    if (!fs.existsSync(SERVER_PID_FILE)) return; // already reaped, or never ours
+    if (allJobs().some(j => j.status === 'running' && withinBudget(j))) continue; // still busy, recheck next tick
+    const pid = Number(fs.readFileSync(SERVER_PID_FILE, 'utf8'));
+    try { process.kill(pid); } catch { /* already dead */ }
+    try { fs.unlinkSync(SERVER_PID_FILE); } catch { /* already gone */ }
+    return;
+  }
+}
+
 async function runOc(job) {
+  await ensureServer();
   // model plan: explicit --model or --no-fallback = single attempt; a
   // role-supplied model HEADS the chain (fallback stays active); otherwise
   // agent default first, then the tier chain (skipping chain[0] = the default)
@@ -586,8 +640,12 @@ async function execJob(job) {
 async function cmdRole() {
   const roles = { ...ROLES, ...(cfg.roles || {}) };
   const [name, ...rest] = pos;
-  const role = roles[name];
-  if (!role) die(`unknown role: ${name || '(none)'}. Available: ${Object.keys(roles).join(', ')}`);
+  const base = roles[name];
+  if (!base) die(`unknown role: ${name || '(none)'}. Available: ${Object.keys(roles).join(', ')}`);
+  // a mode flag merges its partial override onto the base role
+  let role = { ...base };
+  for (const m of MODE_FLAGS) if (opt[m] && base.modes?.[m]) role = { ...role, ...base.modes[m] };
+  if (opt.vs && base.modes?.vs) role = { ...role, ...base.modes.vs };
   const dir = opt.dir && path.resolve(opt.dir);
   if (!dir) die('--dir <absolute project path> is required');
   if (!fs.existsSync(dir)) die('--dir does not exist: ' + dir);
@@ -627,7 +685,8 @@ function cmdRoles() {
     const primary = r.lane === 'agy' ? (r.crossFamily ? `cross-family (default ${r.defaultModel})` : r.model)
       : `${r.agent}${r.roleModel ? ` @ ${r.roleModel}` : ' (agent default + tier chain)'}`;
     const fb = r.fb ? (r.fb.lane === 'agy' ? `agy ${r.fb.model}` : `oc ${r.fb.agent} (manual)`) : 'tier chain';
-    return `${n.padEnd(16)} ${r.lane.padEnd(4)} ${primary.padEnd(48)} fb: ${fb}${r.noEdit ? '  [propose-only]' : ''}`;
+    const modes = r.modes ? `  modes: ${Object.keys(r.modes).map(m => '--' + m).join(' ')}` : '';
+    return `${n.padEnd(9)} ${r.lane.padEnd(4)} ${primary.padEnd(46)} fb: ${fb}${r.noEdit ? '  [propose-only]' : ''}${modes}`;
   });
   out(lines.join('\n'), roles);
 }
@@ -649,6 +708,7 @@ async function cmdStatus() {
         } else j.liveMessageCount = msgs.length;
       } catch { /* server unreachable; report stored state */ }
     }
+    reconcileStale(j); // dead session-less worker never gets refreshed above
     let text = fs.existsSync(outFile(id)) ? fs.readFileSync(outFile(id), 'utf8') : '(no output yet)';
     if (j.status === 'running' && j.lane === 'oc' && j.sessionId) {
       const d = await liveState(j);
@@ -656,9 +716,25 @@ async function cmdStatus() {
     }
     return out(summarize(j, text), { ...j, excerpt: text.split('\n').slice(0, 20).join('\n') });
   }
-  const rows = allJobs().slice(0, 15).map(j =>
+  const rows = allJobs().map(reconcileStale).slice(0, 15).map(j =>
     `${j.id}  ${(j.status || '?').padEnd(7)} ${j.lane || '?'}  ${(j.agent || j.model || '').padEnd(28)} ${j.created}  ${(j.task || '').split('\n')[0]}`);
   out(rows.join('\n') || '(no jobs)', allJobs().slice(0, 15));
+}
+
+async function cmdWait() {
+  const id = pos[0];
+  if (!id) die('usage: offload wait <jobId> [--timeout s]');
+  const timeoutMs = (Number(opt.timeout) || 900) * 1000;
+  const start = Date.now();
+  let j = reconcileStale(loadJob(id));
+  while (j.status === 'running') {
+    if (Date.now() - start > timeoutMs) die(`wait timed out after ${timeoutMs / 1000}s — ${id} still running`);
+    await new Promise(r => setTimeout(r, 3000));
+    j = reconcileStale(loadJob(id));
+  }
+  const text = fs.existsSync(outFile(id)) ? fs.readFileSync(outFile(id), 'utf8') : '(no output yet)';
+  out(summarize(j, text), { ...j, excerpt: text.split('\n').slice(0, 20).join('\n') });
+  process.exit(j.status === 'done' ? 0 : 1);
 }
 
 async function cmdAbort() {
@@ -715,6 +791,7 @@ const table = {
   role: cmdRole,
   roles: cmdRoles,
   status: cmdStatus,
+  wait: cmdWait,
   abort: cmdAbort,
   health: cmdHealth,
   agents: cmdAgents,
@@ -722,15 +799,18 @@ const table = {
   skills: cmdSkills,
   chains: cmdChains,
   _worker: () => worker(pos[0]),
+  _reap: reap,
 };
 if (!table[cmd]) {
   console.log(`offload — run subagent work on free/external models (save Claude tokens)
 
-  offload role <name> "<prompt>" --dir <abs> [--bg] [--skill name] [--vs claude|gemini] [--timeout s]
+  offload role <name> "<prompt>" --dir <abs> [--bg] [--skill name] [--vs claude|gemini] [mode] [--timeout s]
   offload oc <agent> "<prompt>" --dir <abs> [--model p/m] [--bg] [--skill name] [--timeout s] [--no-context] [--json] [--full]
   offload agy "<model label>" "<prompt>" --dir <abs> [--bg] [--skill name] [--timeout s]
-  offload status [jobId] | abort <jobId> | health | agents | models | skills | chains | roles
+  offload status [jobId] | wait <jobId> [--timeout s] | abort <jobId> | health | agents | models | skills | chains | roles
 
+  roles (6): plan  research  explore  build  review  security
+  modes:  plan --vs <fam>  |  research --agy  |  build --careful  |  review --hard --vs <fam>  |  review --ui
   'role' = specialized agents with per-role model routing + fallback (see 'roles').
   oc lane fails over automatically across the tier's model chain (see 'chains');
   disable with --no-fallback or by passing an explicit --model.`);

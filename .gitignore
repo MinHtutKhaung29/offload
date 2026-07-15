@@ -2,3 +2,8 @@ jobs/
 config.json
 projects.json
 *.log
+server.pid
+# internal design/review work-product (contain local paths / PII)
+ARCH_REVIEW.md
+TEAM_DESIGN.md
+TEAM_TEST_PLAN.md
