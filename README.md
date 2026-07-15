@@ -11,29 +11,14 @@ One ~700-line Node script. No dependencies, no MCP server. Two lanes:
 
 ## How it works
 
-```
-                         ┌─────────────────────────┐
-   your orchestrator ───▶│   offload.mjs  (CLI)    │
-   (Claude Code, etc.)   │  - require --dir        │
-                         │  - inject project router│
-                         │  - "don't spawn subagts"│
-                         └───────────┬─────────────┘
-                          route by role / lane
-                    ┌────────────────┴───────────────┐
-                    ▼                                 ▼
-          ┌──────────────────┐              ┌──────────────────┐
-          │  oc lane         │              │  agy lane        │
-          │  opencode serve  │              │  agy CLI one-shot│
-          │  fresh session   │              │  model verified  │
-          │  tier failover ──┼── retry      │  from log        │
-          │  (stale/empty/   │   next model │  quota detected  │
-          │   429 → next)    │              │                  │
-          └────────┬─────────┘              └────────┬─────────┘
-                   └──────────────┬──────────────────┘
-                                  ▼
-                        jobs/<id>.json  (state)
-                        jobs/<id>.out.md (result)
-              compact ~20-line summary returned to orchestrator
+```mermaid
+flowchart TD
+    O["orchestrator (Claude Code, etc.)<br/>require --dir · inject project router · no sub-agents"]
+    O -->|route by role / lane| OC["oc lane — opencode serve<br/>fresh session · tier failover<br/>(stale / empty / 429 → next model)"]
+    O -->|route by role / lane| AGY["agy lane — agy CLI one-shot<br/>model verified from log<br/>quota exhaustion detected"]
+    OC --> J["jobs/&lt;id&gt;.json (state)<br/>jobs/&lt;id&gt;.out.md (result)"]
+    AGY --> J
+    J -->|~20-line summary| O
 ```
 
 ## Why not the MCP bridge?
