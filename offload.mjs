@@ -13,6 +13,10 @@ import { fileURLToPath } from 'node:url';
 const HOME = os.homedir();
 const BASE = path.join(HOME, '.config', 'offload');
 const JOBS = path.join(BASE, 'jobs');
+// agy lane: file-based role charters. --agent subagents crash in agy print
+// mode (no tool converter for Read), but AGENTS.md rules load headless — so
+// each agy role's spec lives at agy-roles/<key>/AGENTS.md, added via --add-dir.
+const AGYROLES = path.join(BASE, 'agy-roles');
 const SERVER_PID_FILE = path.join(BASE, 'server.pid');
 const IDLE_SHUTDOWN_MS = 5 * 60 * 1000;
 const SELF = fileURLToPath(import.meta.url);
@@ -68,50 +72,42 @@ const OPENROUTER_DAILY_STOP = 45; // pool is 50/day shared with agents we don't 
 // 2026-07-08 agent-design research: absolute paths, explicit output contract,
 // hard stop condition. Tool guidance differs from oc: agy Gemini reads PDFs
 // NATIVELY (no pypdf step). Keep this in sync with agents/researcher.md.
-const RESEARCHER_SPEC_AGY = [
-  'RESEARCHER. Process over conclusions: every claim traced, confidence calibrated, contradictions reported.',
-  'Before start: check skills library, invoke relevant skill. Don\'t wait for skill name.',
-  'WORKFLOW: (1) FRAME question(s), one sentence each, state scope. (2) GATHER 3+ independent sources, different types; follow references in best sources; never skip a contradicting source. (3) ASSESS each source HIGH/MEDIUM/LOW (authority, recency, purpose); Wikipedia/AI summaries = navigation only, never cite as evidence. (4) EXTRACT own words but copy numbers/dates/caveats VERBATIM; record source+location per claim. (5) SYNTHESIZE by THEME not source; state agreement/disagreement + conditions. (6) WRITE file, stop.',
-  'WEB READING: prefer `firecrawl scrape "<url>"` (clean markdown, handles JS) over plain fetch; `firecrawl search "<query>"` = search+content in one call. Fallback: native fetch on firecrawl error. Cite page, never snippet.',
-  'PDFs/books: read natively, FULLY, chunked if long, running notes. Never summarize from partial read.',
-  'OUTPUT: ONE markdown file at given absolute path. Create exactly there, no filesystem search. Sections: Question & scope / Summary (BLUF) / Findings by theme (claim -> citation [source, title, date, URL] -> confidence HIGH|MODERATE|LOW|SPECULATIVE) / Contradictions & open questions / Limitations / Sources (list + retrieval date). Exclude raw snippets, tool logs, speculation-as-fact. Never "proves" without 2+ independent HIGH sources.',
-  'BOUNDARIES: no edits except findings file. No build/git/install commands. No sub-agents. Code edits/decisions needed -> stop, report "out of researcher scope".',
-  'DONE WHEN: findings file exists, all sections populated, every claim cited. Final message: 3-5 line summary + file path. Nothing else.',
-].join('\n');
+// Role substance now lives in the agy charters (agy-roles/<key>/AGENTS.md, added
+// via --add-dir) and the oc agent files. `pre:` is just a short role tag — the
+// charter/agent file carries the full spec on whichever lane runs.
 
 // 6-role compact team (2026-07-15). Modes = flags that merge a partial override
 // onto the base role (--vs critic, --careful, --hard, --ui, --agy). Cut roles
 // (backend/tester/build-fixer/cleaner/doc-writer/reviewer-hard: 0 usage over 286
 // jobs) stay reachable via raw `offload oc <agent>`. NOTE: glm-5.1 on
 // security-reviewer is UNTESTED — old zai-glm-4.7 canary-FAILED (silent no-op).
-const RESEARCH_PRE = 'RESEARCHER. Task: one sentence first, then details. Rules: cite every claim inline (source, date, URL); confidence HIGH/MODERATE/LOW; report contradictions, never false consensus; copy numbers verbatim; synthesize by theme not source; write ONE findings markdown file at given path, stop. No edits to existing files. PDFs: extract via python pypdf to <name>_extracted.txt, read that; empty extraction = scanned, report "needs vision lane", move on.';
 const ROLES = {
   plan:     { lane: 'agy', model: 'Claude Opus 4.6 (Thinking)', pool: 'claude', fb: { lane: 'oc', agent: 'planner' },
-    pre: 'PLANNER. Concrete step-by-step implementation plan: files, order, risks, verification. No implementation.',
+    pre: 'PLANNER.',
     modes: { vs: { crossFamily: true, defaultModel: 'GPT-OSS 120B (Medium)', noEdit: true, fb: { lane: 'oc', agent: 'oracle' },
-      pre: 'PLAN CRITIC. Adversarial review: find flaws, risks, missing steps, better alternatives.' } } },
-  research: { lane: 'oc', agent: 'researcher', roleModel: 'opencode/nemotron-3-ultra-free', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (Low)', pool: 'gemini' },
-    pre: RESEARCH_PRE,
-    // --agy: run on the agy lane w/ the native-PDF Gemini spec (fan-out member 3)
-    modes: { agy: { lane: 'agy', model: 'Gemini 3.5 Flash (Medium)', pool: 'gemini', agent: undefined, roleModel: undefined, pre: RESEARCHER_SPEC_AGY } } },
+      pre: 'PLAN CRITIC.' } } },
+  research: { lane: 'oc', agent: 'researcher', roleModel: 'opencode/hy3-free', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (Low)', pool: 'gemini' },
+    pre: 'RESEARCHER.',
+    // --agy: run on the agy lane (charter loads via --add-dir; base research charter reused)
+    modes: { agy: { lane: 'agy', model: 'Gemini 3.5 Flash (Medium)', pool: 'gemini', agent: undefined, roleModel: undefined } } },
   explore:  { lane: 'oc', agent: 'explore', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (Low)', pool: 'gemini' },
-    pre: 'EXPLORER. Locate and explain code/files relevant to question. Read-only. Report paths + findings.' },
+    pre: 'EXPLORER.' },
   build:    { lane: 'oc', agent: 'build', fb: { lane: 'agy', model: 'Gemini 3.5 Flash (High)', pool: 'gemini' },
-    pre: 'BUILDER. Implement the described change. Match existing style, patterns, error handling. Check your skill library for a skill matching this task, and invoke/apply it if one fits. In your final report, state which skill (if any) you used.',
+    pre: 'BUILDER.',
     // --careful: risky multi-file work -> agy Sonnet w/ grep-before-edit discipline
     modes: { careful: { lane: 'agy', model: 'Claude Sonnet 4.6 (Thinking)', pool: 'claude', agent: undefined, fb: { lane: 'agy', model: 'Gemini 3.5 Flash (High)', pool: 'gemini' },
-      pre: 'CAREFUL BUILDER. Risky multi-file changes. Check your skill library for a skill matching this task, and invoke/apply it if one fits. Before each edit: grep the exact search string first and confirm it is unique in the file; edit in small chunks; after each edit, re-read the changed region and confirm only the intended lines changed (check the line-count delta matches intent). Minimal, consistent changes. In your final report, state which skill (if any) you used.' } } },
+      pre: 'CAREFUL BUILDER.' } } },
   review:   { lane: 'oc', agent: 'code-reviewer', noEdit: true, roleModel: 'opencode/deepseek-v4-flash-free', fb: { lane: 'agy', model: 'Claude Sonnet 4.6 (Thinking)', pool: 'claude' },
-    pre: 'CODE REVIEWER. Review code/diff: bugs, quality, maintainability. Report findings ranked by severity.',
+    pre: 'CODE REVIEWER.',
     modes: {
       // --hard: high-stakes adversarial review, cross-family vs the work's author (--vs)
       hard: { lane: 'agy', crossFamily: true, defaultModel: 'Claude Opus 4.6 (Thinking)', agent: undefined, roleModel: undefined, noEdit: true, fb: { lane: 'oc', agent: 'oracle' },
-        pre: 'ADVERSARIAL REVIEWER. High-stakes work. Actively find what\'s wrong or risky. Challenge assumptions.' },
+        pre: 'ADVERSARIAL REVIEWER.' },
       // --ui: visual/UX review on the dedicated oc agent (its own Gemini default)
       ui: { lane: 'oc', agent: 'ecc-ui-reviewer', roleModel: undefined, noEdit: true, fb: { lane: 'agy', model: 'Gemini 3.1 Pro (High)', pool: 'gemini' },
-        pre: 'UI CRITIC. Evaluate visual design, layout, UX quality. Report concrete issues + improvements.' } } },
-  security: { lane: 'oc', agent: 'security-reviewer', noEdit: true, fb: { lane: 'agy', model: 'Claude Opus 4.6 (Thinking)', pool: 'claude' },
-    pre: 'SECURITY REVIEWER. Audit vulnerabilities: injection, auth, secrets, OWASP Top 10. Report findings with severity.' },
+        pre: 'UI CRITIC.' } } },
+  security: { lane: 'oc', agent: 'security-reviewer', roleModel: 'opencode/deepseek-v4-flash-free', noEdit: true, fb: { lane: 'agy', model: 'Claude Opus 4.6 (Thinking)', pool: 'claude' },
+    pre: 'SECURITY REVIEWER.' },
 };
 const MODE_FLAGS = ['agy', 'careful', 'hard', 'ui'];
 // cross-family pick: the reviewer must be a different model family than the
@@ -550,8 +546,13 @@ function runAgyOnce(job) {
   const log = path.join(JOBS, job.id + '.agy.log');
   job.logFile = log;
   saveJob(job);
-  const res = spawnSync(AGY, ['-p', job.fullPrompt, '--model', job.model, '--log-file', log,
-    '--print-timeout', (Number(job.timeout) || 300) + 's', '--add-dir', job.dir],
+  const args = ['-p', job.fullPrompt, '--model', job.model, '--log-file', log,
+    '--print-timeout', (Number(job.timeout) || 300) + 's', '--add-dir', job.dir];
+  // file-based role charter: prefer mode-specific (role-mode), else base role
+  const charter = [job.charterKey, job.role].map(k => k && path.join(AGYROLES, k))
+    .find(d => d && fs.existsSync(path.join(d, 'AGENTS.md')));
+  if (charter) { args.push('--add-dir', charter); job.charterDir = charter; }
+  const res = spawnSync(AGY, args,
     { encoding: 'utf8', timeout: ((Number(job.timeout) || 300) + 60) * 1000, maxBuffer: 32 * 1024 * 1024 });
   const stdout = res.stdout || '';
   const logTxt = fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : '';
@@ -644,8 +645,9 @@ async function cmdRole() {
   if (!base) die(`unknown role: ${name || '(none)'}. Available: ${Object.keys(roles).join(', ')}`);
   // a mode flag merges its partial override onto the base role
   let role = { ...base };
-  for (const m of MODE_FLAGS) if (opt[m] && base.modes?.[m]) role = { ...role, ...base.modes[m] };
-  if (opt.vs && base.modes?.vs) role = { ...role, ...base.modes.vs };
+  let activeMode = null;
+  for (const m of MODE_FLAGS) if (opt[m] && base.modes?.[m]) { role = { ...role, ...base.modes[m] }; activeMode = m; }
+  if (opt.vs && base.modes?.vs) { role = { ...role, ...base.modes.vs }; activeMode = 'vs'; }
   const dir = opt.dir && path.resolve(opt.dir);
   if (!dir) die('--dir <absolute project path> is required');
   if (!fs.existsSync(dir)) die('--dir does not exist: ' + dir);
@@ -662,6 +664,7 @@ async function cmdRole() {
   const job = {
     id: newId(), lane: role.lane, dir, status: 'running', created: now(),
     role: name,
+    charterKey: activeMode ? `${name}-${activeMode}` : name,
     agent: role.lane === 'oc' ? role.agent : undefined,
     model: role.lane === 'agy' ? agyModel : undefined,
     roleModel: role.lane === 'oc' ? role.roleModel : undefined,
